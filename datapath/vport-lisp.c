@@ -79,19 +79,19 @@ struct lisphdr {
 	__u8 rflags:3;
 #endif
 	union {
-	    __u8 nonce[3];
-	    __u8 map_version[3];
+		__u8 nonce[3];
+		__u8 map_version[3];
 	} u1;
 	union {
-	    __be32 lsb_bits;
-	    __be32 iid;
+		__be32 lsb_bits;
+		__be32 iid;
 	} u2;
 };
 
 #define LISP_HLEN (sizeof(struct udphdr) + sizeof(struct lisphdr))
 
 static inline int lisp_hdr_len(const struct tnl_mutable_config *mutable,
-				const struct ovs_key_ipv4_tunnel *tun_key)
+			       const struct ovs_key_ipv4_tunnel *tun_key)
 {
 	return LISP_HLEN;
 }
@@ -111,18 +111,18 @@ static u16 get_src_port(struct sk_buff *skb)
 	unsigned int range;
 	u32 hash = OVS_CB(skb)->flow->hash;
 
-        inet_get_local_port_range(&low, &high);
-        range = (high - low) + 1;
+	inet_get_local_port_range(&low, &high);
+	range = (high - low) + 1;
 	return (((u64) hash * range) >> 32) + low;
 }
 
 static struct sk_buff *lisp_pre_tunnel(const struct vport *vport,
-					  const struct tnl_mutable_config *mutable,
-					  struct sk_buff *skb)
+				       const struct tnl_mutable_config *mutable,
+				       struct sk_buff *skb)
 {
-    /* Pop off "inner" Ethernet header */
-    skb_pull(skb, ETH_HLEN);
-    return skb;
+	/* Pop off "inner" Ethernet header */
+	skb_pull(skb, ETH_HLEN);
+	return skb;
 }
 
 /* Returns the least-significant 32 bits of a __be64. */
@@ -136,10 +136,10 @@ static __be32 be64_get_low32(__be64 x)
 }
 
 static struct sk_buff *lisp_build_header(const struct vport *vport,
-					  const struct tnl_mutable_config *mutable,
-					  struct dst_entry *dst,
-					  struct sk_buff *skb,
-					  int tunnel_hlen)
+					 const struct tnl_mutable_config *mutable,
+					 struct dst_entry *dst,
+					 struct sk_buff *skb,
+					 int tunnel_hlen)
 {
 	struct udphdr *udph = udp_hdr(skb);
 	struct lisphdr *lisph = (struct lisphdr *)(udph + 1);
@@ -205,7 +205,7 @@ static int lisp_rcv(struct sock *sk, struct sk_buff *skb)
 
 	iph = ip_hdr(skb);
 	vport = ovs_tnl_find_port(dev_net(skb->dev), iph->daddr, iph->saddr,
-		key, TNL_T_PROTO_LISP, &mutable);
+				  key, TNL_T_PROTO_LISP, &mutable);
 	if (unlikely(!vport)) {
 		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, 0);
 		goto error;
