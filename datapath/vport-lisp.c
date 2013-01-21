@@ -239,7 +239,7 @@ out:
 }
 
 /* Random value.  Irrelevant as long as it's not 0 since we set the handler. */
-#define UDP_ENCAP_VXLAN 1
+#define UDP_ENCAP_LISP 1
 static int lisp_socket_init(struct net *net)
 {
 	int err;
@@ -261,7 +261,7 @@ static int lisp_socket_init(struct net *net)
 	if (err)
 		goto error_sock;
 
-	udp_sk(lisp_rcv_socket->sk)->encap_type = UDP_ENCAP_VXLAN;
+	udp_sk(lisp_rcv_socket->sk)->encap_type = UDP_ENCAP_LISP;
 	udp_sk(lisp_rcv_socket->sk)->encap_rcv = lisp_rcv;
 
 	udp_encap_enable();
