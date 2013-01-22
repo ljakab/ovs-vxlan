@@ -8,7 +8,10 @@ up LISP tunnels in Open vSwitch, until support for L3 tunnels will improve.
 
 This guide assumes a point-to-point tunnel between two VMs connected to OVS
 bridges on different hypervisors connected via IPv4.  Of course, more than one
-VM may be connected to any of the hypervisors, using the same LISP tunnel.
+VM may be connected to any of the hypervisors, using the same LISP tunnel, and
+a hypervisor may be connected to several hypervisors over different LISP
+tunnels.
+
 There are several scenarios:
 
   1) the VMs have IP addresses in the same subnet and the hypervisors are also
@@ -63,9 +66,3 @@ Flows on br0 are configured as follows:
     priority=2,in_port=1,dl_type=0x0806,action=NORMAL
     priority=1,in_port=1,dl_type=0x0800,vlan_tci=0,nw_src=<EID_prefix>,action=output:3
     priority=0,action=NORMAL
-
-Not that currently you may only configure one LISP vport per hypervisor,
-because LISP uses the well known UDP port 4341 for listening for incoming
-encapsulated traffic.  Since we set the option `remote_ip` this restricts LISP
-use to a single peer.  Once the bits will be there to use LISP as null port,
-tunnels to any number of peers will be possible with a single vport.
