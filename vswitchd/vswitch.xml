@@ -1280,11 +1280,9 @@
 
           <dt><code>lisp</code></dt>
           <dd>
-            A layer 3 tunnel over the experimental, UDP-based LISP
-            protocol described at
-            <code>http://tools.ietf.org/html/draft-ietf-lisp-24</code>.
-            LISP is currently supported only with the Linux kernel datapath
-            with kernel version 2.6.26 or later.
+            A layer 3 tunnel over the experimental, UDP-based Locator/ID
+            Separation Protocol (RFC 6830). LISP is currently supported only
+            with the Linux kernel datapath with kernel version 2.6.26 or later.
           </dd>
 
           <dt><code>patch</code></dt>
