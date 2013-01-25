@@ -59,37 +59,44 @@ static struct lisp_net lisp_net;
 /**
  * struct lisphdr - LISP header
  * @nonce_present: Flag indicating the presence of a 24 bit nonce value.
- * @lsb: Flag indicating the presence of Locator Status Bits (LSB).
- * @echo_nonce: Flag indicating the use of the echo noncing mechanism.
- * @map_version: Flag indicating the use of mapping versioning.
- * @instance_id: Flag indicating the presence of a 24 bit Instance ID (IID).
- * @rflags: 3 bits reserved for future flags.
+ * @locator_status_bits_present: Flag indicating the presence of Locator Status
+ *                               Bits (LSB).
+ * @solicit_echo_nonce: Flag indicating the use of the echo noncing mechanism.
+ * @map_version_present: Flag indicating the use of mapping versioning.
+ * @instance_id_present: Flag indicating the presence of a 24 bit Instance ID.
+ * @reserved_flags: 3 bits reserved for future flags.
  * @nonce: 24 bit nonce value.
- * @lsb_bits: 32 bit Locator Status Bits
+ * @map_version: 24 bit mapping version.
+ * @locator_status_bits: Locator Status Bits: 32 bits when instance_id_present
+ *                       is not set, 8 bits when it is.
+ * @instance_id: 24 bit Instance ID
  */
 struct lisphdr {
 #ifdef __LITTLE_ENDIAN_BITFIELD
-	__u8 rflags:3;
-	__u8 instance_id:1;
-	__u8 map_version:1;
-	__u8 echo_nonce:1;
-	__u8 lsb:1;
+	__u8 reserved_flags:3;
+	__u8 instance_id_present:1;
+	__u8 map_version_present:1;
+	__u8 solicit_echo_nonce:1;
+	__u8 locator_status_bits_present:1;
 	__u8 nonce_present:1;
 #else
 	__u8 nonce_present:1;
-	__u8 lsb:1;
-	__u8 echo_nonce:1;
-	__u8 map_version:1;
-	__u8 instance_id:1;
-	__u8 rflags:3;
+	__u8 locator_status_bits_present:1;
+	__u8 solicit_echo_nonce:1;
+	__u8 map_version_present:1;
+	__u8 instance_id_present:1;
+	__u8 reserved_flags:3;
 #endif
 	union {
 		__u8 nonce[3];
 		__u8 map_version[3];
 	} u1;
 	union {
-		__be32 lsb_bits;
-		__be32 iid;
+		__be32 locator_status_bits;
+		struct {
+			__u8 instance_id[3];
+			__u8 locator_status_bits;
+		} word2;
 	} u2;
 };
 
@@ -121,22 +128,46 @@ static u16 get_src_port(struct sk_buff *skb)
 	return (((u64) hash * range) >> 32) + low;
 }
 
-static struct sk_buff *lisp_pre_tunnel(const struct vport *vport,
-				       const struct tnl_mutable_config *mutable,
-				       struct sk_buff *skb)
+static int lisp_tnl_send(struct vport *vport, struct sk_buff *skb)
 {
-	/* Pop off "inner" Ethernet header */
-	skb_pull(skb, ETH_HLEN);
-	return skb;
+	int network_offset = skb_network_offset(skb);
+
+	/* We only encapsulate IPv4 and IPv6 packets */
+	switch (ntohs(skb->protocol)) {
+	case ETH_P_IP:
+	case ETH_P_IPV6:
+		/* Pop off "inner" Ethernet header */
+		skb_pull(skb, network_offset);
+		return ovs_tnl_send(vport, skb) + network_offset;
+	default:
+		kfree_skb(skb);
+		return 0;
+	}
 }
 
-/* Returns the least-significant 32 bits of a __be64. */
-static __be32 be64_get_low32(__be64 x)
+/* Convert 64 bit tunnel ID to 24 bit Instance ID. */
+static void tunnel_id_to_instance_id(__be64 tun_id, __u8 *iid)
+{
+
+#ifdef __BIG_ENDIAN
+	iid[0] = (__force __u8)(tun_id >> 16);
+	iid[1] = (__force __u8)(tun_id >> 8);
+	iid[2] = (__force __u8)tun_id;
+#else
+	iid[0] = (__force __u8)((__force u64)tun_id >> 40);
+	iid[1] = (__force __u8)((__force u64)tun_id >> 48);
+	iid[2] = (__force __u8)((__force u64)tun_id >> 56);
+#endif
+}
+
+/* Convert 24 bit Instance ID to 64 bit tunnel ID. */
+static __be64 instance_id_to_tunnel_id(__u8 *iid)
 {
 #ifdef __BIG_ENDIAN
-	return (__force __be32)x;
+	return (iid[0] << 16) | (iid[1] << 8) | iid[2];
 #else
-	return (__force __be32)((__force u64)x >> 32);
+	return ((__force __be64)iid[0] << 40) | ((__force __be64)iid[1] << 48) |
+	       ((__force __be64)iid[2] << 56);
 #endif
 }
 
@@ -159,18 +190,19 @@ static struct sk_buff *lisp_build_header(const struct vport *vport,
 	udph->check = 0;
 	udph->len = htons(skb->len - skb_transport_offset(skb));
 
-	lisph->nonce_present = 1;   /* We add a nonce instead of map version */
-	lisph->lsb = 0;		    /* No reason to set LSBs, just one RLOC */
-	lisph->echo_nonce = 0;	    /* No echo noncing */
-	lisph->map_version = 0;	    /* No mapping versioning, nonce instead */
-	lisph->instance_id = 1;	    /* Store the tun_id as Instance ID  */
-	lisph->rflags = 1;	    /* Reserved flags, set to 0  */
+	lisph->nonce_present = 0;	/* We don't support echo nonce algorithm */
+	lisph->locator_status_bits_present = 1;	/* Set LSB */
+	lisph->solicit_echo_nonce = 0;	/* No echo noncing */
+	lisph->map_version_present = 0;	/* No mapping versioning, nonce instead */
+	lisph->instance_id_present = 1;	/* Store the tun_id as Instance ID  */
+	lisph->reserved_flags = 0;	/* Reserved flags, set to 0  */
 
-	lisph->u1.nonce[0] = net_random() & 0xFF;
-	lisph->u1.nonce[1] = net_random() & 0xFF;
-	lisph->u1.nonce[2] = net_random() & 0xFF;
+	lisph->u1.nonce[0] = 0;
+	lisph->u1.nonce[1] = 0;
+	lisph->u1.nonce[2] = 0;
 
-	lisph->u2.iid = htonl(be64_get_low32(tun_key->tun_id));
+	tunnel_id_to_instance_id(out_key, &lisph->u2.word2.instance_id[0]);
+	lisph->u2.word2.locator_status_bits = 1;
 
 	/*
 	 * Allow our local IP stack to fragment the outer packet even if the
@@ -190,23 +222,25 @@ static int lisp_rcv(struct sock *sk, struct sk_buff *skb)
 	struct vport *vport;
 	struct lisphdr *lisph;
 	const struct tnl_mutable_config *mutable;
-	struct iphdr *iph;
+	struct iphdr *iph, *inner_iph;
 	struct ovs_key_ipv4_tunnel tun_key;
 	__be64 key;
 	u32 tunnel_flags = 0;
 	struct ethhdr *ethh;
+	__be16 protocol;
 
 	if (unlikely(!pskb_may_pull(skb, LISP_HLEN)))
 		goto error;
 
 	lisph = lisp_hdr(skb);
-	if (unlikely(lisph->instance_id != 1))
-		goto error;
 
 	__skb_pull(skb, LISP_HLEN);
 	skb_postpull_rcsum(skb, skb_transport_header(skb), LISP_HLEN);
 
-	key = cpu_to_be64(ntohl(lisph->u2.iid));
+	if (lisph->instance_id_present != 1)
+		key = 0;
+	else
+		key = instance_id_to_tunnel_id(&lisph->u2.word2.instance_id[0]);
 
 	iph = ip_hdr(skb);
 	vport = ovs_tnl_find_port(dev_net(skb->dev), iph->daddr, iph->saddr,
@@ -225,6 +259,19 @@ static int lisp_rcv(struct sock *sk, struct sk_buff *skb)
 	tnl_tun_key_init(&tun_key, iph, key, tunnel_flags);
 	OVS_CB(skb)->tun_key = &tun_key;
 
+	/* Drop non-IP inner packets */
+	inner_iph = (struct iphdr *)(lisph + 1);
+	switch (inner_iph->version) {
+	case 4:
+		protocol = htons(ETH_P_IP);
+		break;
+	case 6:
+		protocol = htons(ETH_P_IPV6);
+		break;
+	default:
+		goto error;
+	}
+
 	/* Add Ethernet header */
 	skb_push(skb, ETH_HLEN);
 
@@ -232,7 +279,7 @@ static int lisp_rcv(struct sock *sk, struct sk_buff *skb)
 	memset(ethh, 0, ETH_HLEN);
 	ethh->h_dest[0] = 0x02;
 	ethh->h_source[0] = 0x02;
-	ethh->h_proto = htons(ETH_P_IP);
+	ethh->h_proto = protocol;
 
 	ovs_tnl_rcv(vport, skb);
 	goto out;
@@ -292,7 +339,6 @@ static const struct tnl_ops ovs_lisp_tnl_ops = {
 	.tunnel_type	= TNL_T_PROTO_LISP,
 	.ipproto	= IPPROTO_UDP,
 	.hdr_len	= lisp_hdr_len,
-	.pre_tunnel	= lisp_pre_tunnel,
 	.build_header	= lisp_build_header,
 };
 
@@ -344,7 +390,7 @@ const struct vport_ops ovs_lisp_vport_ops = {
 	.get_addr	= ovs_tnl_get_addr,
 	.get_options	= ovs_tnl_get_options,
 	.set_options	= ovs_tnl_set_options,
-	.send		= ovs_tnl_send,
+	.send		= lisp_tnl_send,
 };
 #else
 #warning LISP tunneling will not be available on kernels before 2.6.26
