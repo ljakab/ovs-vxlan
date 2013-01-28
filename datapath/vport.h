@@ -27,12 +27,14 @@
 #include <linux/u64_stats_sync.h>
 
 #include "vport-capwap.h"
+#include "vport-lisp.h"
 
 struct vport;
 struct vport_parms;
 
 struct vport_net {
 	struct capwap_net capwap;
+	struct lisp_net lisp;
 };
 
 /* The following definitions are for users of the vport subsytem: */
@@ -240,5 +242,6 @@ extern const struct vport_ops ovs_gre_ft_vport_ops;
 extern const struct vport_ops ovs_gre64_vport_ops;
 extern const struct vport_ops ovs_capwap_vport_ops;
 extern const struct vport_ops ovs_vxlan_vport_ops;
+extern const struct vport_ops ovs_lisp_vport_ops;
 
 #endif /* vport.h */
