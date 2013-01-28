@@ -394,6 +394,27 @@ vconn_get_version(const struct vconn *vconn)
     return vconn->version ? vconn->version : -1;
 }
 
+/* By default, a vconn accepts only OpenFlow messages whose version matches the
+ * one negotiated for the connection.  A message received with a different
+ * version is an error that causes the vconn to drop the connection.
+ *
+ * This functions allows 'vconn' to accept messages with any OpenFlow version.
+ * This is useful in the special case where 'vconn' is used as an rconn
+ * "monitor" connection (see rconn_add_monitor()), that is, where 'vconn' is
+ * used as a target for mirroring OpenFlow messages for debugging and
+ * troubleshooting.
+ *
+ * This function should be called after a successful vconn_open() or
+ * pvconn_accept() but before the connection completes, that is, before
+ * vconn_connect() returns success.  Otherwise, messages that arrive on 'vconn'
+ * beforehand with an unexpected version will the vconn to drop the
+ * connection. */
+void
+vconn_set_recv_any_version(struct vconn *vconn)
+{
+    vconn->recv_any_version = true;
+}
+
 static void
 vcs_connecting(struct vconn *vconn)
 {
@@ -600,7 +621,7 @@ vconn_recv(struct vconn *vconn, struct ofpbuf **msgp)
     if (!retval) {
         retval = do_recv(vconn, &msg);
     }
-    if (!retval) {
+    if (!retval && !vconn->recv_any_version) {
         const struct ofp_header *oh = msg->data;
         if (oh->version != vconn->version) {
             enum ofptype type;
@@ -1091,17 +1112,13 @@ void
 vconn_init(struct vconn *vconn, struct vconn_class *class, int connect_status,
            const char *name, uint32_t allowed_versions)
 {
+    memset(vconn, 0, sizeof *vconn);
     vconn->class = class;
     vconn->state = (connect_status == EAGAIN ? VCS_CONNECTING
                     : !connect_status ? VCS_SEND_HELLO
                     : VCS_DISCONNECTED);
     vconn->error = connect_status;
-    vconn->version = 0;
     vconn->allowed_versions = allowed_versions;
-    vconn->remote_ip = 0;
-    vconn->remote_port = 0;
-    vconn->local_ip = 0;
-    vconn->local_port = 0;
     vconn->name = xstrdup(name);
     ovs_assert(vconn->state != VCS_CONNECTING || class->connect);
 }

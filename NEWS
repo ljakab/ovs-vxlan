@@ -1,5 +1,9 @@
 post-v1.9.0
 --------------------
+    - Bridge compatibility support has been removed.  Any uses that
+      rely on ovs-brcompatd will have to stick with Open vSwitch 1.9.x
+      or adapt to native Open vSwitch support (e.g. use ovs-vsctl instead
+      of brctl).
     - The maximum size of the MAC learning table is now configurable.
     - New support for the VXLAN tunnel protocol (see the IETF draft here:
       http://tools.ietf.org/html/draft-mahalingam-dutt-dcops-vxlan-02).
@@ -21,6 +25,7 @@ post-v1.9.0
         retire that meaning of ANY in favor of the OpenFlow 1.1 meaning.
     - Inheritance of the Don't Fragment bit in IP tunnels (df_inherit) is
       no longer supported.
+    - Patch ports are implemented in userspace.
 
 
 v1.9.0 - xx xxx xxxx

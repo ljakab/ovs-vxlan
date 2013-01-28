@@ -419,6 +419,7 @@ ofproto_create(const char *datapath_name, const char *datapath_type,
     ofproto->max_ports = OFPP_MAX;
     ofproto->tables = NULL;
     ofproto->n_tables = 0;
+    list_init(&ofproto->expirable);
     ofproto->connmgr = connmgr_create(ofproto, datapath_name, datapath_name);
     ofproto->state = S_OPENFLOW;
     list_init(&ofproto->pending);
@@ -1644,7 +1645,9 @@ alloc_ofp_port(struct ofproto *ofproto, const char *netdev_name)
 static void
 dealloc_ofp_port(const struct ofproto *ofproto, uint16_t ofp_port)
 {
-    bitmap_set0(ofproto->ofp_port_ids, ofp_port);
+    if (ofp_port < ofproto->max_ports) {
+        bitmap_set0(ofproto->ofp_port_ids, ofp_port);
+    }
 }
 
 /* Opens and returns a netdev for 'ofproto_port' in 'ofproto', or a null
@@ -2809,11 +2812,7 @@ flow_stats_ds(struct rule *rule, struct ds *results)
     ds_put_format(results, "n_bytes=%"PRIu64", ", byte_count);
     cls_rule_format(&rule->cr, results);
     ds_put_char(results, ',');
-    if (rule->ofpacts_len > 0) {
-        ofpacts_format(rule->ofpacts, rule->ofpacts_len, results);
-    } else {
-        ds_put_cstr(results, "drop");
-    }
+    ofpacts_format(rule->ofpacts, rule->ofpacts_len, results);
     ds_put_cstr(results, "\n");
 }
 
@@ -3166,6 +3165,7 @@ add_flow(struct ofproto *ofproto, struct ofconn *ofconn,
     rule->ofpacts_len = fm->ofpacts_len;
     rule->evictable = true;
     rule->eviction_group = NULL;
+    list_init(&rule->expirable);
     rule->monitor_flags = 0;
     rule->add_seqno = 0;
     rule->modify_seqno = 0;
@@ -3261,10 +3261,6 @@ modify_flows__(struct ofproto *ofproto, struct ofconn *ofconn,
         new_cookie = (fm->new_cookie != htonll(UINT64_MAX)
                       ? fm->new_cookie
                       : rule->flow_cookie);
-        if (!actions_changed && new_cookie == rule->flow_cookie) {
-            /* No change at all. */
-            continue;
-        }
 
         op = ofoperation_create(group, rule, OFOPERATION_MODIFY, 0);
         rule->flow_cookie = new_cookie;
@@ -3503,7 +3499,7 @@ handle_flow_mod(struct ofconn *ofconn, const struct ofp_header *oh)
                               &fm.match.flow, ofproto->max_ports);
     }
     if (!error) {
-        error = handle_flow_mod__(ofconn_get_ofproto(ofconn), ofconn, &fm, oh);
+        error = handle_flow_mod__(ofproto, ofconn, &fm, oh);
     }
     if (error) {
         goto exit_free_ofpacts;
@@ -4247,7 +4243,19 @@ ofopgroup_complete(struct ofopgroup *group)
     LIST_FOR_EACH_SAFE (op, next_op, group_node, &group->ops) {
         struct rule *rule = op->rule;
 
-        if (!op->error && !ofproto_rule_is_hidden(rule)) {
+        /* We generally want to report the change to active OpenFlow flow
+           monitors (e.g. NXST_FLOW_MONITOR).  There are three exceptions:
+
+              - The operation failed.
+
+              - The affected rule is not visible to controllers.
+
+              - The operation's only effect was to update rule->modified. */
+        if (!(op->error
+              || ofproto_rule_is_hidden(rule)
+              || (op->type == OFOPERATION_MODIFY
+                  && op->ofpacts
+                  && rule->flow_cookie == op->flow_cookie))) {
             /* Check that we can just cast from ofoperation_type to
              * nx_flow_update_event. */
             BUILD_ASSERT_DECL((enum nx_flow_update_event) OFOPERATION_ADD
@@ -4828,6 +4836,9 @@ oftable_remove_rule(struct rule *rule)
 
     classifier_remove(&table->cls, &rule->cr);
     eviction_group_remove_rule(rule);
+    if (!list_is_empty(&rule->expirable)) {
+        list_remove(&rule->expirable);
+    }
 }
 
 /* Inserts 'rule' into its oftable.  Removes any existing rule from 'rule''s
@@ -4839,9 +4850,17 @@ oftable_replace_rule(struct rule *rule)
     struct ofproto *ofproto = rule->ofproto;
     struct oftable *table = &ofproto->tables[rule->table_id];
     struct rule *victim;
+    bool may_expire = rule->hard_timeout || rule->idle_timeout;
+
+    if (may_expire) {
+        list_insert(&ofproto->expirable, &rule->expirable);
+    }
 
     victim = rule_from_cls_rule(classifier_replace(&table->cls, &rule->cr));
     if (victim) {
+        if (!list_is_empty(&victim->expirable)) {
+            list_remove(&victim->expirable);
+        }
         eviction_group_remove_rule(victim);
     }
     eviction_group_add_rule(rule);
