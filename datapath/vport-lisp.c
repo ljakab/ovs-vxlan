@@ -38,12 +38,6 @@
 
 #define LISP_DST_PORT 4341  /* Well known UDP port for LISP data packets. */
 
-struct lisp_net {
-	struct socket *lisp_rcv_socket;
-	int n_tunnels;
-};
-static struct lisp_net lisp_net;
-
 
 /*
  *  LISP encapsulation header:
@@ -111,6 +105,12 @@ static inline int lisp_hdr_len(const struct tnl_mutable_config *mutable,
 static inline struct lisphdr *lisp_hdr(const struct sk_buff *skb)
 {
 	return (struct lisphdr *)(udp_hdr(skb) + 1);
+}
+
+static inline struct lisp_net *ovs_get_lisp_net(struct net *net)
+{
+	struct ovs_net *ovs_net = net_generic(net, ovs_net_id);
+	return &ovs_net->vport_net.lisp;
 }
 
 /* Compute source port for outgoing packet.
@@ -295,41 +295,42 @@ out:
 static int lisp_socket_init(struct net *net)
 {
 	int err;
+	struct lisp_net *lisp_net = ovs_get_lisp_net(net);
 	struct sockaddr_in sin;
 
-	if (lisp_net.n_tunnels) {
-		lisp_net.n_tunnels++;
+	if (lisp_net->n_tunnels) {
+		lisp_net->n_tunnels++;
 		return 0;
 	}
 
 	err = sock_create_kern(AF_INET, SOCK_DGRAM, 0,
-			       &lisp_net.lisp_rcv_socket);
+			       &lisp_net->lisp_rcv_socket);
 	if (err)
 		goto error;
 
 	/* release net ref. */
-	sk_change_net(lisp_net.lisp_rcv_socket->sk, net);
+	sk_change_net(lisp_net->lisp_rcv_socket->sk, net);
 
 	sin.sin_family = AF_INET;
 	sin.sin_addr.s_addr = htonl(INADDR_ANY);
 	sin.sin_port = htons(LISP_DST_PORT);
 
-	err = kernel_bind(lisp_net.lisp_rcv_socket,
+	err = kernel_bind(lisp_net->lisp_rcv_socket,
 			  (struct sockaddr *)&sin,
 			  sizeof(struct sockaddr_in));
 	if (err)
 		goto error_sock;
 
-	udp_sk(lisp_net.lisp_rcv_socket->sk)->encap_type = UDP_ENCAP_LISP;
-	udp_sk(lisp_net.lisp_rcv_socket->sk)->encap_rcv = lisp_rcv;
+	udp_sk(lisp_net->lisp_rcv_socket->sk)->encap_type = UDP_ENCAP_LISP;
+	udp_sk(lisp_net->lisp_rcv_socket->sk)->encap_rcv = lisp_rcv;
 
 	udp_encap_enable();
-	lisp_net.n_tunnels++;
+	lisp_net->n_tunnels++;
 
 	return 0;
 
 error_sock:
-	sk_release_kernel(lisp_net.lisp_rcv_socket->sk);
+	sk_release_kernel(lisp_net->lisp_rcv_socket->sk);
 error:
 	pr_warn("cannot register lisp protocol handler: %d\n", err);
 	return err;
@@ -344,11 +345,13 @@ static const struct tnl_ops ovs_lisp_tnl_ops = {
 
 static void release_socket(struct net *net)
 {
-	lisp_net.n_tunnels--;
-	if (lisp_net.n_tunnels)
+	struct lisp_net *lisp_net = ovs_get_lisp_net(net);
+
+	lisp_net->n_tunnels--;
+	if (lisp_net->n_tunnels)
 		return;
 
-	sk_release_kernel(lisp_net.lisp_rcv_socket->sk);
+	sk_release_kernel(lisp_net->lisp_rcv_socket->sk);
 }
 
 static void lisp_tnl_destroy(struct vport *vport)
@@ -373,16 +376,9 @@ static struct vport *lisp_tnl_create(const struct vport_parms *parms)
 	return vport;
 }
 
-static int lisp_tnl_init(void)
-{
-	lisp_net.n_tunnels = 0;
-	return 0;
-}
-
 const struct vport_ops ovs_lisp_vport_ops = {
 	.type		= OVS_VPORT_TYPE_LISP,
 	.flags		= VPORT_F_TUN_ID,
-	.init		= lisp_tnl_init,
 	.create		= lisp_tnl_create,
 	.destroy	= lisp_tnl_destroy,
 	.set_addr	= ovs_tnl_set_addr,
