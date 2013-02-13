@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009, 2010, 2011, 2012 Nicira, Inc.
+ * Copyright (c) 2009, 2010, 2011, 2012, 2013 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,7 +44,7 @@ struct netdev_stats;
 
 struct ofproto_controller_info {
     bool is_connected;
-    enum nx_role role;
+    enum ofp12_controller_role role;
     struct {
         const char *keys[4];
         const char *values[4];
@@ -282,7 +282,6 @@ struct ofproto_bundle_settings {
     bool use_priority_tags;     /* Use 802.1p tag for frames in VLAN 0? */
 
     struct bond_settings *bond; /* Must be nonnull iff if n_slaves > 1. */
-    uint32_t *bond_stable_ids;  /* Array of n_slaves elements. */
 
     struct lacp_settings *lacp;              /* Nonnull to enable LACP. */
     struct lacp_slave_settings *lacp_slaves; /* Array of n_slaves elements. */

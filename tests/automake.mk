@@ -21,7 +21,6 @@ TESTSUITE_AT = \
 	tests/ovs-ofctl.at \
 	tests/odp.at \
 	tests/multipath.at \
-	tests/autopath.at \
 	tests/lacp.at \
 	tests/learn.at \
 	tests/vconn.at \
@@ -33,6 +32,7 @@ TESTSUITE_AT = \
 	tests/jsonrpc.at \
 	tests/jsonrpc-py.at \
 	tests/timeval.at \
+	tests/tunnel.at \
 	tests/lockfile.at \
 	tests/reconnect.at \
 	tests/ofproto-dpif.at \
@@ -307,6 +307,7 @@ CHECK_PYFILES = \
 	tests/test-ovsdb.py \
 	tests/test-reconnect.py \
 	tests/MockXenAPI.py \
+	tests/test-unix-socket.py \
 	tests/test-unixctl.py \
 	tests/test-vlog.py
 EXTRA_DIST += $(CHECK_PYFILES)

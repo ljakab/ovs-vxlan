@@ -915,6 +915,34 @@ for the tag. Only ethertype 0x8100 should be used. (0x88a8 which the spec
 allows isn't supported at the moment.)
 A priority of zero and the tag of zero are used for the new tag.
 .
+.IP \fBpush_mpls\fR:\fIethertype\fR
+If the packet does not already contain any MPLS labels, changes the
+packet's Ethertype to \fIethertype\fR, which must be either the MPLS
+unicast Ethertype \fB0x8847\fR or the MPLS multicast Ethertype
+\fB0x8848\fR, and then pushes an initial label stack entry.  The label
+stack entry's default label is 2 if the packet contains IPv6 and 0
+otherwise, its default traffic control value is the low 3 bits of the
+packet's DSCP value (0 if the packet is not IP), and its TTL is copied
+from the IP TTL (64 if the packet is not IP).
+.IP
+If the packet does already contain an MPLS label, pushes a new
+outermost label as a copy of the existing outermost label.
+.IP
+There are some limitations in the implementation.  \fBpush_mpls\fR
+followed by another \fBpush_mpls\fR will result in the first
+\fBpush_mpls\fR being discarded.
+.
+.IP \fBpop_mpls\fR:\fIethertype\fR
+Strips the outermost MPLS label stack entry.  If the MPLS label
+stripped was the only one, changes the ethertype of a packet to
+\fIethertype\fR, which should not ordinarily be an MPLS Ethertype.
+.
+.IP
+There are some limitations in the implementation.  \fBpop_mpls\fR
+followed by another \fBpush_mpls\fR without an intermediate
+\fBpush_mpls\fR will result in the first \fBpush_mpls\fR being
+discarded.
+.
 .IP \fBmod_dl_src\fB:\fImac\fR
 Sets the source Ethernet address to \fImac\fR.
 .
@@ -1043,21 +1071,6 @@ Currently, \fIfields\fR must be either \fBeth_src\fR or
 \fBsymmetric_l4\fR and \fIalgorithm\fR must be one of \fBmodulo_n\fR,
 \fBhash_threshold\fR, \fBhrw\fR, and \fBiter_hash\fR.  Only
 the \fBiter_hash\fR algorithm uses \fIarg\fR.
-.IP
-Refer to \fBnicira\-ext.h\fR for more details.
-.
-.IP "\fBautopath(\fIid\fB, \fIdst\fB[\fIstart\fB..\fIend\fB])\fR"
-Deprecated and slated for removal in Feburary 2013.
-.IP
-Given \fIid\fR, chooses an OpenFlow port and populates it in
-\fIdst\fB[\fIstart\fB..\fIend\fB]\fR, which must be an NXM field as
-described above.
-.IP
-Currently, \fIid\fR should be the OpenFlow port number of an interface on the
-bridge.  If it isn't then \fIdst\fB[\fIstart\fB..\fIend\fB]\fR will be
-populated with the OpenFlow port "none".  If \fIid\fR is a member of a bond,
-the normal bond selection logic will be used to choose the destination port.
-Otherwise, the register will be populated with \fIid\fR itself.
 .IP
 Refer to \fBnicira\-ext.h\fR for more details.
 .

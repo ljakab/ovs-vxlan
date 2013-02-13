@@ -23,6 +23,7 @@
 #include "flow.h"
 #include "list.h"
 #include "netdev-provider.h"
+#include "netdev-vport.h"
 #include "odp-util.h"
 #include "ofp-print.h"
 #include "ofpbuf.h"
@@ -34,6 +35,12 @@
 #include "vlog.h"
 
 VLOG_DEFINE_THIS_MODULE(netdev_dummy);
+
+#ifdef __FreeBSD__
+#define FREE_BSD 1
+#else
+#define FREE_BSD 0
+#endif
 
 struct netdev_dev_dummy {
     struct netdev_dev netdev_dev;
@@ -198,6 +205,19 @@ netdev_dummy_drain(struct netdev *netdev_)
 }
 
 static int
+netdev_dummy_send(struct netdev *netdev, const void *buffer OVS_UNUSED,
+                  size_t size)
+{
+    struct netdev_dev_dummy *dev =
+        netdev_dev_dummy_cast(netdev_get_dev(netdev));
+
+    dev->stats.tx_packets++;
+    dev->stats.tx_bytes += size;
+
+    return 0;
+}
+
+static int
 netdev_dummy_set_etheraddr(struct netdev *netdev,
                            const uint8_t mac[ETH_ADDR_LEN])
 {
@@ -329,7 +349,7 @@ static const struct netdev_class dummy_class = {
     netdev_dummy_recv_wait,
     netdev_dummy_drain,
 
-    NULL,                       /* send */
+    netdev_dummy_send,          /* send */
     NULL,                       /* send_wait */
 
     netdev_dummy_set_etheraddr,
@@ -436,6 +456,9 @@ netdev_dummy_receive(struct unixctl_conn *conn,
             return;
         }
 
+        dummy_dev->stats.rx_packets++;
+        dummy_dev->stats.rx_bytes += packet->size;
+
         n_listeners = 0;
         LIST_FOR_EACH (dev, node, &dummy_dev->devs) {
             if (dev->listening) {
@@ -530,4 +553,8 @@ netdev_dummy_register(bool override)
         sset_destroy(&types);
     }
     netdev_register_provider(&dummy_class);
+
+    if (FREE_BSD) {
+        netdev_vport_tunnel_register();
+    }
 }

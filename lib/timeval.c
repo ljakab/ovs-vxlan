@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008, 2009, 2010, 2011, 2012 Nicira, Inc.
+ * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -328,7 +328,7 @@ time_alarm(unsigned int secs)
     time_refresh();
 
     now = time_msec();
-    msecs = secs * 1000;
+    msecs = secs * 1000LL;
 
     block_sigalrm(&oldsigs);
     deadline = now < LLONG_MAX - msecs ? now + msecs : LLONG_MAX;
@@ -516,7 +516,7 @@ log_poll_interval(long long int last_wakeup)
 {
     long long int interval = time_msec() - last_wakeup;
 
-    if (interval >= 1000) {
+    if (interval >= 1000 && !warp_offset.tv_sec && !warp_offset.tv_nsec) {
         const struct rusage *last_rusage = get_recent_rusage();
         struct rusage rusage;
 

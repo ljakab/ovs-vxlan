@@ -858,22 +858,6 @@
           information such as destination MAC address, IP address, and TCP
           port.
         </dd>
-
-        <dt><code>stable</code></dt>
-        <dd>
-          <p>Deprecated and slated for removal in February 2013.</p>
-          <p>Attempts to always assign a given flow to the same slave
-          consistently.  In an effort to maintain stability, no load
-          balancing is done.  Uses a similar hashing strategy to
-          <code>balance-tcp</code>, always taking into account L3 and L4
-          fields even if LACP negotiations are unsuccessful. </p>
-          <p>Slave selection decisions are made based on <ref table="Interface"
-          column="other_config" key="bond-stable-id"/> if set.  Otherwise,
-          OpenFlow port number is used.  Decisions are consistent across all
-          <code>ovs-vswitchd</code> instances with equivalent
-          <ref table="Interface" column="other_config" key="bond-stable-id"/>
-          values.</p>
-        </dd>
       </dl>
 
       <p>These columns apply only to bonded ports.  Their values are
@@ -1301,8 +1285,8 @@
       <p>
         These options apply to interfaces with <ref column="type"/> of
         <code>gre</code>, <code>ipsec_gre</code>, <code>gre64</code>,
-        <code>ipsec_gre64</code>, <code>capwap</code>, and
-        <code>vxlan</code>.
+        <code>ipsec_gre64</code>, <code>capwap</code>, <code>vxlan</code>,
+        and <code>lisp</code>.
       </p>
 
       <p>
@@ -1345,8 +1329,8 @@
             key="in_key"/> at all.
           </li>
           <li>
-            A positive 24-bit (for VXLAN), 32-bit (for GRE) or 64-bit (for
-            CAPWAP) number.  The tunnel receives only packets with the
+            A positive 24-bit (for VXLAN and LISP), 32-bit (for GRE) or 64-bit
+            (for CAPWAP) number.  The tunnel receives only packets with the
             specified key.
           </li>
           <li>
@@ -1372,8 +1356,8 @@
             key="out_key"/> at all.
           </li>
           <li>
-            A positive 24-bit (for VXLAN), 32-bit (for GRE) or 64-bit (for
-            CAPWAP) number.  Packets sent through the tunnel will have the
+            A positive 24-bit (for VXLAN and LISP), 32-bit (for GRE) or 64-bit
+            (for CAPWAP) number.  Packets sent through the tunnel will have the
             specified key.
           </li>
           <li>
@@ -1917,16 +1901,6 @@
     </group>
 
     <group title="Bonding Configuration">
-      <column name="other_config" key="bond-stable-id"
-              type='{"type": "integer", "minInteger": 1}'>
-        Used in <code>stable</code> bond mode to make slave
-        selection decisions.  Allocating <ref column="other_config"
-        key="bond-stable-id"/> values consistently across interfaces
-        participating in a bond will guarantee consistent slave selection
-        decisions across <code>ovs-vswitchd</code> instances when using
-        <code>stable</code> bonding mode.
-      </column>
-
       <column name="other_config" key="lacp-port-id"
               type='{"type": "integer", "minInteger": 1, "maxInteger": 65535}'>
         The LACP port ID of this <ref table="Interface"/>.  Port IDs are

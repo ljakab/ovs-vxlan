@@ -22,7 +22,6 @@
 #include <errno.h>
 #include <stdlib.h>
 
-#include "autopath.h"
 #include "bundle.h"
 #include "byte-order.h"
 #include "dynamic-string.h"
@@ -526,10 +525,6 @@ parse_named_action(enum ofputil_action_code code, const struct flow *flow,
         multipath_parse(ofpact_put_MULTIPATH(ofpacts), arg);
         break;
 
-    case OFPUTIL_NXAST_AUTOPATH__DEPRECATED:
-        autopath_parse(ofpact_put_AUTOPATH(ofpacts), arg);
-        break;
-
     case OFPUTIL_NXAST_BUNDLE:
         bundle_parse(arg, ofpacts);
         break;
@@ -561,6 +556,18 @@ parse_named_action(enum ofputil_action_code code, const struct flow *flow,
 
     case OFPUTIL_NXAST_CONTROLLER:
         parse_controller(ofpacts, arg);
+        break;
+
+    case OFPUTIL_OFPAT11_PUSH_MPLS:
+    case OFPUTIL_NXAST_PUSH_MPLS:
+        ofpact_put_PUSH_MPLS(ofpacts)->ethertype =
+            htons(str_to_u16(arg, "push_mpls"));
+        break;
+
+    case OFPUTIL_OFPAT11_POP_MPLS:
+    case OFPUTIL_NXAST_POP_MPLS:
+        ofpact_put_POP_MPLS(ofpacts)->ethertype =
+            htons(str_to_u16(arg, "pop_mpls"));
         break;
     }
 }
@@ -726,7 +733,9 @@ parse_protocol(const char *name, const struct protocol **p_out)
         { "tcp6", ETH_TYPE_IPV6, IPPROTO_TCP },
         { "udp6", ETH_TYPE_IPV6, IPPROTO_UDP },
         { "rarp", ETH_TYPE_RARP, 0},
-};
+        { "mpls", ETH_TYPE_MPLS, 0 },
+        { "mplsm", ETH_TYPE_MPLS_MCAST, 0 },
+    };
     const struct protocol *p;
 
     for (p = protocols; p < &protocols[ARRAY_SIZE(protocols)]; p++) {
@@ -914,7 +923,9 @@ parse_ofp_str(struct ofputil_flow_mod *fm, int command, const char *str_,
                 parse_field(mf_from_name(name), value, &fm->match);
             } else if (!strcmp(name, "duration")
                        || !strcmp(name, "n_packets")
-                       || !strcmp(name, "n_bytes")) {
+                       || !strcmp(name, "n_bytes")
+                       || !strcmp(name, "idle_age")
+                       || !strcmp(name, "hard_age")) {
                 /* Ignore these, so that users can feed the output of
                  * "ovs-ofctl dump-flows" back into commands that parse
                  * flows. */
@@ -1147,6 +1158,10 @@ parse_ofp_exact_flow(struct flow *flow, const char *s)
 
             mf_set_flow_value(mf, &value, flow);
         }
+    }
+
+    if (!flow->in_port) {
+        flow->in_port = OFPP_NONE;
     }
 
 exit:

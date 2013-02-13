@@ -10,8 +10,6 @@ noinst_LIBRARIES += lib/libopenvswitch.a
 lib_libopenvswitch_a_SOURCES = \
 	lib/aes128.c \
 	lib/aes128.h \
-	lib/autopath.c \
-	lib/autopath.h \
 	lib/backtrace.c \
 	lib/backtrace.h \
 	lib/bitmap.c \
@@ -91,6 +89,8 @@ lib_libopenvswitch_a_SOURCES = \
 	lib/multipath.h \
 	lib/netdev-dummy.c \
 	lib/netdev-provider.h \
+	lib/netdev-vport.c \
+	lib/netdev-vport.h \
 	lib/netdev.c \
 	lib/netdev.h \
 	lib/netflow.h \
@@ -237,8 +237,6 @@ lib_libopenvswitch_a_SOURCES += \
 	lib/dpif-linux.h \
 	lib/netdev-linux.c \
 	lib/netdev-linux.h \
-	lib/netdev-vport.c \
-	lib/netdev-vport.h \
 	lib/netlink-notifier.c \
 	lib/netlink-notifier.h \
 	lib/netlink-protocol.h \

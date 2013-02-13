@@ -23,7 +23,6 @@
 #include <netinet/in.h>
 #include <netinet/icmp6.h>
 #include <stdlib.h>
-#include "autopath.h"
 #include "bundle.h"
 #include "byte-order.h"
 #include "classifier.h"
@@ -85,7 +84,7 @@ ofputil_netmask_to_wcbits(ovs_be32 netmask)
 void
 ofputil_wildcard_from_ofpfw10(uint32_t ofpfw, struct flow_wildcards *wc)
 {
-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 18);
+    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 19);
 
     /* Initialize most of wc. */
     flow_wildcards_init_catchall(wc);
@@ -440,8 +439,7 @@ ofputil_match_from_ofp11_match(const struct ofp11_match *ofmatch,
         }
     }
 
-    if (match->flow.dl_type == htons(ETH_TYPE_MPLS) ||
-        match->flow.dl_type == htons(ETH_TYPE_MPLS_MCAST)) {
+    if (eth_type_mpls(match->flow.dl_type)) {
         enum { OFPFW11_MPLS_ALL = OFPFW11_MPLS_LABEL | OFPFW11_MPLS_TC };
 
         if ((wc & OFPFW11_MPLS_ALL) != OFPFW11_MPLS_ALL) {
@@ -1060,7 +1058,7 @@ ofputil_usable_protocols(const struct match *match)
 {
     const struct flow_wildcards *wc = &match->wc;
 
-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 18);
+    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 19);
 
     /* tunnel params other than tun_id can't be sent in a flow_mod */
     if (!tun_parms_fully_wildcarded(wc)) {
@@ -1148,6 +1146,26 @@ ofputil_usable_protocols(const struct match *match)
     /* NXM and OXM support bitwise matching on transport port. */
     if ((wc->masks.tp_src && wc->masks.tp_src != htons(UINT16_MAX)) ||
         (wc->masks.tp_dst && wc->masks.tp_dst != htons(UINT16_MAX))) {
+        return OFPUTIL_P_OF10_NXM_ANY | OFPUTIL_P_OF12_OXM
+            | OFPUTIL_P_OF13_OXM;
+    }
+
+    /* NXM and OF1.1+ support matching MPLS label */
+    if (wc->masks.mpls_lse & htonl(MPLS_LABEL_MASK)) {
+        return OFPUTIL_P_OF10_NXM_ANY | OFPUTIL_P_OF12_OXM
+            | OFPUTIL_P_OF13_OXM;
+    }
+
+    /* NXM and OF1.1+ support matching MPLS TC */
+    if (wc->masks.mpls_lse & htonl(MPLS_TC_MASK)) {
+        return OFPUTIL_P_OF10_NXM_ANY | OFPUTIL_P_OF12_OXM
+            | OFPUTIL_P_OF13_OXM;
+    }
+
+    /* NXM and OF1.3+ support matching MPLS stack flag */
+    /* Allow for OF1.2 as there doesn't seem to be a
+     * particularly good reason not to */
+    if (wc->masks.mpls_lse & htonl(MPLS_BOS_MASK)) {
         return OFPUTIL_P_OF10_NXM_ANY | OFPUTIL_P_OF12_OXM
             | OFPUTIL_P_OF13_OXM;
     }
@@ -3364,43 +3382,54 @@ enum ofperr
 ofputil_decode_role_message(const struct ofp_header *oh,
                             struct ofputil_role_request *rr)
 {
-    const struct ofp12_role_request *orr = ofpmsg_body(oh);
-    uint32_t role = ntohl(orr->role);
     struct ofpbuf b;
     enum ofpraw raw;
-
-    memset(rr, 0, sizeof *rr);
 
     ofpbuf_use_const(&b, oh, ntohs(oh->length));
     raw = ofpraw_pull_assert(&b);
 
-    if (raw == OFPRAW_OFPT12_ROLE_REQUEST
-        || raw == OFPRAW_OFPT12_ROLE_REPLY) {
+    if (raw == OFPRAW_OFPT12_ROLE_REQUEST ||
+        raw == OFPRAW_OFPT12_ROLE_REPLY) {
+        const struct ofp12_role_request *orr = b.l3;
 
-        if (raw == OFPRAW_OFPT12_ROLE_REQUEST) {
-            if (role == OFPCR12_ROLE_NOCHANGE) {
-                rr->request_current_role_only = true;
-                return 0;
-            }
-            if (role == OFPCR12_ROLE_MASTER || role == OFPCR12_ROLE_SLAVE) {
-                rr->generation_id = ntohll(orr->generation_id);
-                rr->have_generation_id = true;
-            }
+        if (orr->role != htonl(OFPCR12_ROLE_NOCHANGE) &&
+            orr->role != htonl(OFPCR12_ROLE_EQUAL) &&
+            orr->role != htonl(OFPCR12_ROLE_MASTER) &&
+            orr->role != htonl(OFPCR12_ROLE_SLAVE)) {
+            return OFPERR_OFPRRFC_BAD_ROLE;
         }
 
-        /* Map to enum nx_role */
-        role -= 1; /* OFPCR12_ROLE_MASTER -> NX_ROLE_MASTER etc. */
-    } else if (raw != OFPRAW_NXT_ROLE_REQUEST
-               && raw != OFPRAW_NXT_ROLE_REPLY) {
-        return OFPERR_OFPBRC_BAD_TYPE;
+        rr->role = ntohl(orr->role);
+        if (raw == OFPRAW_OFPT12_ROLE_REQUEST
+            ? orr->role == htonl(OFPCR12_ROLE_NOCHANGE)
+            : orr->generation_id == htonll(UINT64_MAX)) {
+            rr->have_generation_id = false;
+            rr->generation_id = 0;
+        } else {
+            rr->have_generation_id = true;
+            rr->generation_id = ntohll(orr->generation_id);
+        }
+    } else if (raw == OFPRAW_NXT_ROLE_REQUEST ||
+               raw == OFPRAW_NXT_ROLE_REPLY) {
+        const struct nx_role_request *nrr = b.l3;
+
+        BUILD_ASSERT(NX_ROLE_OTHER + 1 == OFPCR12_ROLE_EQUAL);
+        BUILD_ASSERT(NX_ROLE_MASTER + 1 == OFPCR12_ROLE_MASTER);
+        BUILD_ASSERT(NX_ROLE_SLAVE + 1 == OFPCR12_ROLE_SLAVE);
+
+        if (nrr->role != htonl(NX_ROLE_OTHER) &&
+            nrr->role != htonl(NX_ROLE_MASTER) &&
+            nrr->role != htonl(NX_ROLE_SLAVE)) {
+            return OFPERR_OFPRRFC_BAD_ROLE;
+        }
+
+        rr->role = ntohl(nrr->role) + 1;
+        rr->have_generation_id = false;
+        rr->generation_id = 0;
+    } else {
+        NOT_REACHED();
     }
 
-    if (role != NX_ROLE_OTHER && role != NX_ROLE_MASTER
-        && role != NX_ROLE_SLAVE) {
-        return OFPERR_OFPRRFC_BAD_ROLE;
-    }
-
-    rr->role = role;
     return 0;
 }
 
@@ -3408,47 +3437,35 @@ ofputil_decode_role_message(const struct ofp_header *oh,
  * buffer owned by the caller. */
 struct ofpbuf *
 ofputil_encode_role_reply(const struct ofp_header *request,
-                          enum nx_role role)
+                          const struct ofputil_role_request *rr)
 {
-    struct ofp12_role_request *reply;
     struct ofpbuf *buf;
-    size_t reply_size;
-
-    struct ofpbuf b;
     enum ofpraw raw;
 
-    ofpbuf_use_const(&b, request, ntohs(request->length));
-    raw = ofpraw_pull_assert(&b);
+    raw = ofpraw_decode_assert(request);
     if (raw == OFPRAW_OFPT12_ROLE_REQUEST) {
-        reply_size = sizeof (struct ofp12_role_request);
-        raw = OFPRAW_OFPT12_ROLE_REPLY;
-    }
-    else if (raw == OFPRAW_NXT_ROLE_REQUEST) {
-        reply_size = sizeof (struct nx_role_request);
-        raw = OFPRAW_NXT_ROLE_REPLY;
+        struct ofp12_role_request *orr;
+
+        buf = ofpraw_alloc_reply(OFPRAW_OFPT12_ROLE_REPLY, request, 0);
+        orr = ofpbuf_put_zeros(buf, sizeof *orr);
+
+        orr->role = htonl(rr->role);
+        orr->generation_id = htonll(rr->have_generation_id
+                                    ? rr->generation_id
+                                    : UINT64_MAX);
+    } else if (raw == OFPRAW_NXT_ROLE_REQUEST) {
+        struct nx_role_request *nrr;
+
+        BUILD_ASSERT(NX_ROLE_OTHER == OFPCR12_ROLE_EQUAL - 1);
+        BUILD_ASSERT(NX_ROLE_MASTER == OFPCR12_ROLE_MASTER - 1);
+        BUILD_ASSERT(NX_ROLE_SLAVE == OFPCR12_ROLE_SLAVE - 1);
+
+        buf = ofpraw_alloc_reply(OFPRAW_NXT_ROLE_REPLY, request, 0);
+        nrr = ofpbuf_put_zeros(buf, sizeof *nrr);
+        nrr->role = htonl(rr->role - 1);
     } else {
         NOT_REACHED();
     }
-
-    buf = ofpraw_alloc_reply(raw, request, 0);
-    reply = ofpbuf_put_zeros(buf, reply_size);
-
-    if (raw == OFPRAW_OFPT12_ROLE_REPLY) {
-        /* Map to OpenFlow enum ofp12_controller_role */
-        role += 1; /* NX_ROLE_MASTER -> OFPCR12_ROLE_MASTER etc. */
-        /*
-         * OpenFlow specification does not specify use of generation_id field
-         * on reply messages.  Intuitively, it would seem a good idea to return
-         * the current value.  However, the current value is undefined
-         * initially, and there is no way to insert an undefined value in the
-         * message.  Therefore we leave the generation_id zeroed on reply
-         * messages.
-         *
-         * A request for clarification has been filed with the Open Networking
-         * Foundation as EXT-272.
-         */
-    }
-    reply->role = htonl(role);
 
     return buf;
 }
@@ -4115,14 +4132,14 @@ ofputil_port_from_string(const char *s, uint16_t *portp)
             *portp = port32;
             return true;
         } else if (port32 <= OFPP_LAST_RESV) {
-            struct ds s;
+            struct ds msg;
 
-            ds_init(&s);
-            ofputil_format_port(port32, &s);
+            ds_init(&msg);
+            ofputil_format_port(port32, &msg);
             VLOG_WARN_ONCE("referring to port %s as %u is deprecated for "
                            "compatibility with future versions of OpenFlow",
-                           ds_cstr(&s), port32);
-            ds_destroy(&s);
+                           ds_cstr(&msg), port32);
+            ds_destroy(&msg);
 
             *portp = port32;
             return true;
@@ -4307,7 +4324,8 @@ ofputil_normalize_match__(struct match *match, bool may_log)
         MAY_ARP_SHA     = 1 << 4, /* arp_sha */
         MAY_ARP_THA     = 1 << 5, /* arp_tha */
         MAY_IPV6        = 1 << 6, /* ipv6_src, ipv6_dst, ipv6_label */
-        MAY_ND_TARGET   = 1 << 7  /* nd_target */
+        MAY_ND_TARGET   = 1 << 7, /* nd_target */
+        MAY_MPLS        = 1 << 8, /* mpls label and tc */
     } may_match;
 
     struct flow_wildcards wc;
@@ -4336,6 +4354,8 @@ ofputil_normalize_match__(struct match *match, bool may_log)
     } else if (match->flow.dl_type == htons(ETH_TYPE_ARP) ||
                match->flow.dl_type == htons(ETH_TYPE_RARP)) {
         may_match = MAY_NW_PROTO | MAY_NW_ADDR | MAY_ARP_SHA | MAY_ARP_THA;
+    } else if (eth_type_mpls(match->flow.dl_type)) {
+        may_match = MAY_MPLS;
     } else {
         may_match = 0;
     }
@@ -4367,6 +4387,10 @@ ofputil_normalize_match__(struct match *match, bool may_log)
     }
     if (!(may_match & MAY_ND_TARGET)) {
         wc.masks.nd_target = in6addr_any;
+    }
+    if (!(may_match & MAY_MPLS)) {
+        wc.masks.mpls_lse = htonl(0);
+        wc.masks.mpls_depth = 0;
     }
 
     /* Log any changes. */

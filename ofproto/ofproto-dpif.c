@@ -20,7 +20,6 @@
 
 #include <errno.h>
 
-#include "autopath.h"
 #include "bond.h"
 #include "bundle.h"
 #include "byte-order.h"
@@ -52,6 +51,7 @@
 #include "simap.h"
 #include "smap.h"
 #include "timer.h"
+#include "tunnel.h"
 #include "unaligned.h"
 #include "unixctl.h"
 #include "vlan-bitmap.h"
@@ -509,9 +509,9 @@ struct ofport_dpif {
     struct list bundle_node;    /* In struct ofbundle's "ports" list. */
     struct cfm *cfm;            /* Connectivity Fault Management, if any. */
     tag_type tag;               /* Tag associated with this port. */
-    uint32_t bond_stable_id;    /* stable_id to use as bond slave, or 0. */
     bool may_enable;            /* May be enabled in bonds. */
     long long int carrier_seq;  /* Carrier status changes. */
+    struct tnl_port *tnl_port;  /* Tunnel handle, or null. */
 
     /* Spanning tree. */
     struct stp_port *stp_port;  /* Spanning Tree Protocol, if any. */
@@ -615,6 +615,15 @@ COVERAGE_DEFINE(rev_port_toggled);
 COVERAGE_DEFINE(rev_flow_table);
 COVERAGE_DEFINE(rev_inconsistency);
 
+/* Drop keys are odp flow keys which have drop flows installed in the kernel.
+ * These are datapath flows which have no associated ofproto, if they did we
+ * would use facets. */
+struct drop_key {
+    struct hmap_node hmap_node;
+    struct nlattr *key;
+    size_t key_len;
+};
+
 /* All datapaths of a given type share a single dpif backer instance. */
 struct dpif_backer {
     char *type;
@@ -623,14 +632,19 @@ struct dpif_backer {
     struct timer next_expiration;
     struct hmap odp_to_ofport_map; /* ODP port to ofport mapping. */
 
+    struct sset tnl_backers;       /* Set of dpif ports backing tunnels. */
+
     /* Facet revalidation flags applying to facets which use this backer. */
     enum revalidate_reason need_revalidate; /* Revalidate every facet. */
     struct tag_set revalidate_set; /* Revalidate only matching facets. */
+
+    struct hmap drop_keys; /* Set of dropped odp keys. */
 };
 
 /* All existing ofproto_backer instances, indexed by ofproto->up.type. */
 static struct shash all_dpif_backers = SHASH_INITIALIZER(&all_dpif_backers);
 
+static void drop_key_clear(struct dpif_backer *);
 static struct ofport_dpif *
 odp_port_to_ofport(const struct dpif_backer *, uint32_t odp_port);
 
@@ -708,6 +722,7 @@ static struct ofport_dpif *get_odp_port(const struct ofproto_dpif *,
 static void ofproto_trace(struct ofproto_dpif *, const struct flow *,
                           const struct ofpbuf *, ovs_be16 initial_tci,
                           struct ds *);
+static bool may_dpif_port_del(struct ofport_dpif *);
 
 /* Packet processing. */
 static void update_learning_table(struct ofproto_dpif *,
@@ -844,16 +859,22 @@ type_run(const char *type)
         case REV_INCONSISTENCY: COVERAGE_INC(rev_inconsistency); break;
         }
 
+        if (backer->need_revalidate) {
+            /* Clear the drop_keys in case we should now be accepting some
+             * formerly dropped flows. */
+            drop_key_clear(backer);
+        }
+
+        /* Clear the revalidation flags. */
+        tag_set_init(&backer->revalidate_set);
+        backer->need_revalidate = 0;
+
         HMAP_FOR_EACH (ofproto, all_ofproto_dpifs_node, &all_ofproto_dpifs) {
             struct facet *facet;
 
             if (ofproto->backer != backer) {
                 continue;
             }
-
-            /* Clear the revalidation flags. */
-            tag_set_init(&backer->revalidate_set);
-            backer->need_revalidate = 0;
 
             HMAP_FOR_EACH (facet, hmap_node, &ofproto->facets) {
                 if (need_revalidate
@@ -862,7 +883,6 @@ type_run(const char *type)
                 }
             }
         }
-
     }
 
     if (timer_expired(&backer->next_expiration)) {
@@ -878,6 +898,13 @@ type_run(const char *type)
         /* Don't report on the datapath's device. */
         if (!strcmp(devname, dpif_base_name(backer->dpif))) {
             goto next;
+        }
+
+        HMAP_FOR_EACH (ofproto, all_ofproto_dpifs_node,
+                       &all_ofproto_dpifs) {
+            if (sset_contains(&ofproto->backer->tnl_backers, devname)) {
+                goto next;
+            }
         }
 
         ofproto = lookup_ofproto_dpif_by_port_name(devname);
@@ -997,6 +1024,10 @@ close_dpif_backer(struct dpif_backer *backer)
         return;
     }
 
+    drop_key_clear(backer);
+    hmap_destroy(&backer->drop_keys);
+
+    sset_destroy(&backer->tnl_backers);
     hmap_destroy(&backer->odp_to_ofport_map);
     node = shash_find(&all_dpif_backers, backer->type);
     free(backer->type);
@@ -1070,8 +1101,10 @@ open_dpif_backer(const char *type, struct dpif_backer **backerp)
     backer->type = xstrdup(type);
     backer->refcount = 1;
     hmap_init(&backer->odp_to_ofport_map);
+    hmap_init(&backer->drop_keys);
     timer_set_duration(&backer->next_expiration, 1000);
     backer->need_revalidate = 0;
+    sset_init(&backer->tnl_backers);
     tag_set_init(&backer->revalidate_set);
     *backerp = backer;
 
@@ -1526,6 +1559,7 @@ port_construct(struct ofport *port_)
 {
     struct ofport_dpif *port = ofport_dpif_cast(port_);
     struct ofproto_dpif *ofproto = ofproto_dpif_cast(port->up.ofproto);
+    const struct netdev *netdev = port->up.netdev;
     struct dpif_port dpif_port;
     int error;
 
@@ -1536,19 +1570,20 @@ port_construct(struct ofport *port_)
     port->may_enable = true;
     port->stp_port = NULL;
     port->stp_state = STP_DISABLED;
+    port->tnl_port = NULL;
     hmap_init(&port->priorities);
     port->realdev_ofp_port = 0;
     port->vlandev_vid = 0;
-    port->carrier_seq = netdev_get_carrier_resets(port->up.netdev);
+    port->carrier_seq = netdev_get_carrier_resets(netdev);
 
-    if (netdev_vport_is_patch(port->up.netdev)) {
+    if (netdev_vport_is_patch(netdev)) {
         /* XXX By bailing out here, we don't do required sFlow work. */
         port->odp_port = OVSP_NONE;
         return 0;
     }
 
     error = dpif_port_query_by_name(ofproto->backer->dpif,
-                                    netdev_get_name(port->up.netdev),
+                                    netdev_vport_get_dpif_port(netdev),
                                     &dpif_port);
     if (error) {
         return error;
@@ -1556,16 +1591,22 @@ port_construct(struct ofport *port_)
 
     port->odp_port = dpif_port.port_no;
 
-    /* Sanity-check that a mapping doesn't already exist.  This
-     * shouldn't happen. */
-    if (odp_port_to_ofp_port(ofproto, port->odp_port) != OFPP_NONE) {
-        VLOG_ERR("port %s already has an OpenFlow port number\n",
-                 dpif_port.name);
-        return EBUSY;
-    }
+    if (netdev_get_tunnel_config(netdev)) {
+        port->tnl_port = tnl_port_add(&port->up, port->odp_port);
+    } else {
+        /* Sanity-check that a mapping doesn't already exist.  This
+         * shouldn't happen for non-tunnel ports. */
+        if (odp_port_to_ofp_port(ofproto, port->odp_port) != OFPP_NONE) {
+            VLOG_ERR("port %s already has an OpenFlow port number",
+                     dpif_port.name);
+            dpif_port_destroy(&dpif_port);
+            return EBUSY;
+        }
 
-    hmap_insert(&ofproto->backer->odp_to_ofport_map, &port->odp_port_node,
-                hash_int(port->odp_port, 0));
+        hmap_insert(&ofproto->backer->odp_to_ofport_map, &port->odp_port_node,
+                    hash_int(port->odp_port, 0));
+    }
+    dpif_port_destroy(&dpif_port);
 
     if (ofproto->sflow) {
         dpif_sflow_add_port(ofproto->sflow, port_, port->odp_port);
@@ -1579,20 +1620,24 @@ port_destruct(struct ofport *port_)
 {
     struct ofport_dpif *port = ofport_dpif_cast(port_);
     struct ofproto_dpif *ofproto = ofproto_dpif_cast(port->up.ofproto);
+    const char *dp_port_name = netdev_vport_get_dpif_port(port->up.netdev);
     const char *devname = netdev_get_name(port->up.netdev);
 
-    if (dpif_port_exists(ofproto->backer->dpif, devname)) {
+    if (dpif_port_exists(ofproto->backer->dpif, dp_port_name)
+        && may_dpif_port_del(port)) {
         /* The underlying device is still there, so delete it.  This
          * happens when the ofproto is being destroyed, since the caller
          * assumes that removal of attached ports will happen as part of
          * destruction. */
         dpif_port_del(ofproto->backer->dpif, port->odp_port);
+        sset_find_and_delete(&ofproto->backer->tnl_backers, dp_port_name);
     }
 
-    if (port->odp_port != OVSP_NONE) {
+    if (port->odp_port != OVSP_NONE && !port->tnl_port) {
         hmap_remove(&ofproto->backer->odp_to_ofport_map, &port->odp_port_node);
     }
 
+    tnl_port_del(port->tnl_port);
     sset_find_and_delete(&ofproto->ports, devname);
     sset_find_and_delete(&ofproto->ghost_ports, devname);
     ofproto->backer->need_revalidate = REV_RECONFIGURE;
@@ -2168,8 +2213,7 @@ bundle_del_port(struct ofport_dpif *port)
 
 static bool
 bundle_add_port(struct ofbundle *bundle, uint32_t ofp_port,
-                struct lacp_slave_settings *lacp,
-                uint32_t bond_stable_id)
+                struct lacp_slave_settings *lacp)
 {
     struct ofport_dpif *port;
 
@@ -2195,8 +2239,6 @@ bundle_add_port(struct ofbundle *bundle, uint32_t ofp_port,
         bundle->ofproto->backer->need_revalidate = REV_RECONFIGURE;
         lacp_slave_register(bundle->lacp, port, lacp);
     }
-
-    port->bond_stable_id = bond_stable_id;
 
     return true;
 }
@@ -2305,8 +2347,7 @@ bundle_set(struct ofproto *ofproto_, void *aux,
     ok = true;
     for (i = 0; i < s->n_slaves; i++) {
         if (!bundle_add_port(bundle, s->slaves[i],
-                             s->lacp ? &s->lacp_slaves[i] : NULL,
-                             s->bond_stable_ids ? s->bond_stable_ids[i] : 0)) {
+                             s->lacp ? &s->lacp_slaves[i] : NULL)) {
             ok = false;
         }
     }
@@ -2406,8 +2447,7 @@ bundle_set(struct ofproto *ofproto_, void *aux,
         }
 
         LIST_FOR_EACH (port, bundle_node, &bundle->ports) {
-            bond_slave_register(bundle->bond, port, port->bond_stable_id,
-                                port->up.netdev);
+            bond_slave_register(bundle->bond, port, port->up.netdev);
         }
     } else {
         bond_destroy(bundle->bond);
@@ -2881,6 +2921,13 @@ port_run(struct ofport_dpif *ofport)
     ofport->carrier_seq = carrier_seq;
 
     port_run_fast(ofport);
+
+    if (ofport->tnl_port
+        && tnl_port_reconfigure(&ofport->up, ofport->odp_port,
+                                &ofport->tnl_port)) {
+        ofproto_dpif_cast(ofport->up.ofproto)->backer->need_revalidate = true;
+    }
+
     if (ofport->cfm) {
         int cfm_opup = cfm_get_opup(ofport->cfm);
 
@@ -2959,38 +3006,91 @@ static int
 port_add(struct ofproto *ofproto_, struct netdev *netdev)
 {
     struct ofproto_dpif *ofproto = ofproto_dpif_cast(ofproto_);
-    uint32_t odp_port = UINT32_MAX;
-    int error;
+    const char *dp_port_name = netdev_vport_get_dpif_port(netdev);
+    const char *devname = netdev_get_name(netdev);
 
     if (netdev_vport_is_patch(netdev)) {
         sset_add(&ofproto->ghost_ports, netdev_get_name(netdev));
         return 0;
     }
 
-    error = dpif_port_add(ofproto->backer->dpif, netdev, &odp_port);
-    if (!error) {
-        sset_add(&ofproto->ports, netdev_get_name(netdev));
+    if (!dpif_port_exists(ofproto->backer->dpif, dp_port_name)) {
+        int error = dpif_port_add(ofproto->backer->dpif, netdev, NULL);
+        if (error) {
+            return error;
+        }
     }
-    return error;
+
+    if (netdev_get_tunnel_config(netdev)) {
+        sset_add(&ofproto->ghost_ports, devname);
+        sset_add(&ofproto->backer->tnl_backers, dp_port_name);
+    } else {
+        sset_add(&ofproto->ports, devname);
+    }
+    return 0;
+}
+
+/* Returns true if the odp_port backing 'ofport' may be deleted from the
+ * datapath. In most cases, this function simply returns true. However, for
+ * tunnels it's possible that multiple ofports use the same odp_port, in which
+ * case we need to keep the odp_port backer around until the last ofport is
+ * deleted. */
+static bool
+may_dpif_port_del(struct ofport_dpif *ofport)
+{
+    struct dpif_backer *backer = ofproto_dpif_cast(ofport->up.ofproto)->backer;
+    struct ofproto_dpif *ofproto_iter;
+
+    if (!ofport->tnl_port) {
+        return true;
+    }
+
+    HMAP_FOR_EACH (ofproto_iter, all_ofproto_dpifs_node, &all_ofproto_dpifs) {
+        struct ofport_dpif *iter;
+
+        if (backer != ofproto_iter->backer) {
+            continue;
+        }
+
+        HMAP_FOR_EACH (iter, up.hmap_node, &ofproto_iter->up.ports) {
+            if (ofport == iter) {
+                continue;
+            }
+
+            if (!strcmp(netdev_vport_get_dpif_port(ofport->up.netdev),
+                        netdev_vport_get_dpif_port(iter->up.netdev))) {
+                return false;
+            }
+        }
+    }
+
+    return true;
 }
 
 static int
 port_del(struct ofproto *ofproto_, uint16_t ofp_port)
 {
     struct ofproto_dpif *ofproto = ofproto_dpif_cast(ofproto_);
-    uint32_t odp_port = ofp_port_to_odp_port(ofproto, ofp_port);
+    struct ofport_dpif *ofport = get_ofp_port(ofproto, ofp_port);
     int error = 0;
 
-    if (odp_port != OFPP_NONE) {
-        error = dpif_port_del(ofproto->backer->dpif, odp_port);
+    if (!ofport) {
+        return 0;
     }
-    if (!error) {
-        struct ofport_dpif *ofport = get_ofp_port(ofproto, ofp_port);
-        if (ofport) {
+
+    sset_find_and_delete(&ofproto->ghost_ports,
+                         netdev_get_name(ofport->up.netdev));
+    if (may_dpif_port_del(ofport)) {
+        error = dpif_port_del(ofproto->backer->dpif, ofport->odp_port);
+        if (!error) {
+            const char *dpif_port;
+
             /* The caller is going to close ofport->up.netdev.  If this is a
              * bonded port, then the bond is using that netdev, so remove it
              * from the bond.  The client will need to reconfigure everything
              * after deleting ports, so then the slave will get re-added. */
+            dpif_port = netdev_vport_get_dpif_port(ofport->up.netdev);
+            sset_find_and_delete(&ofproto->backer->tnl_backers, dpif_port);
             bundle_remove(&ofport->up);
         }
     }
@@ -3058,6 +3158,9 @@ struct port_dump_state {
     uint32_t bucket;
     uint32_t offset;
     bool ghost;
+
+    struct ofproto_port port;
+    bool has_port;
 };
 
 static int
@@ -3068,7 +3171,7 @@ port_dump_start(const struct ofproto *ofproto_ OVS_UNUSED, void **statep)
 }
 
 static int
-port_dump_next(const struct ofproto *ofproto_ OVS_UNUSED, void *state_,
+port_dump_next(const struct ofproto *ofproto_, void *state_,
                struct ofproto_port *port)
 {
     struct ofproto_dpif *ofproto = ofproto_dpif_cast(ofproto_);
@@ -3076,12 +3179,20 @@ port_dump_next(const struct ofproto *ofproto_ OVS_UNUSED, void *state_,
     const struct sset *sset;
     struct sset_node *node;
 
+    if (state->has_port) {
+        ofproto_port_destroy(&state->port);
+        state->has_port = false;
+    }
     sset = state->ghost ? &ofproto->ghost_ports : &ofproto->ports;
     while ((node = sset_at_position(sset, &state->bucket, &state->offset))) {
         int error;
 
-        error = port_query_by_name(ofproto_, node->name, port);
-        if (error != ENODEV) {
+        error = port_query_by_name(ofproto_, node->name, &state->port);
+        if (!error) {
+            *port = state->port;
+            state->has_port = true;
+            return 0;
+        } else if (error != ENODEV) {
             return error;
         }
     }
@@ -3101,6 +3212,9 @@ port_dump_done(const struct ofproto *ofproto_ OVS_UNUSED, void *state_)
 {
     struct port_dump_state *state = state_;
 
+    if (state->has_port) {
+        ofproto_port_destroy(&state->port);
+    }
     free(state);
     return 0;
 }
@@ -3197,15 +3311,11 @@ send_packet_in_miss(struct ofproto_dpif *ofproto, const struct ofpbuf *packet,
 
 static enum slow_path_reason
 process_special(struct ofproto_dpif *ofproto, const struct flow *flow,
-                const struct ofpbuf *packet)
+                const struct ofport_dpif *ofport, const struct ofpbuf *packet)
 {
-    struct ofport_dpif *ofport = get_ofp_port(ofproto, flow->in_port);
-
     if (!ofport) {
         return 0;
-    }
-
-    if (ofport->cfm && cfm_should_process_flow(ofport->cfm, flow)) {
+    } else if (ofport->cfm && cfm_should_process_flow(ofport->cfm, flow)) {
         if (packet) {
             cfm_process_heartbeat(ofport->cfm, packet);
         }
@@ -3221,8 +3331,9 @@ process_special(struct ofproto_dpif *ofproto, const struct flow *flow,
             stp_process_packet(ofport, packet);
         }
         return SLOW_STP;
+    } else {
+        return 0;
     }
-    return 0;
 }
 
 static struct flow_miss *
@@ -3474,6 +3585,47 @@ handle_flow_miss(struct flow_miss *miss, struct flow_miss_op *ops,
     handle_flow_miss_with_facet(miss, facet, now, ops, n_ops);
 }
 
+static struct drop_key *
+drop_key_lookup(const struct dpif_backer *backer, const struct nlattr *key,
+                size_t key_len)
+{
+    struct drop_key *drop_key;
+
+    HMAP_FOR_EACH_WITH_HASH (drop_key, hmap_node, hash_bytes(key, key_len, 0),
+                             &backer->drop_keys) {
+        if (drop_key->key_len == key_len
+            && !memcmp(drop_key->key, key, key_len)) {
+            return drop_key;
+        }
+    }
+    return NULL;
+}
+
+static void
+drop_key_clear(struct dpif_backer *backer)
+{
+    static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 15);
+    struct drop_key *drop_key, *next;
+
+    HMAP_FOR_EACH_SAFE (drop_key, next, hmap_node, &backer->drop_keys) {
+        int error;
+
+        error = dpif_flow_del(backer->dpif, drop_key->key, drop_key->key_len,
+                              NULL);
+        if (error && !VLOG_DROP_WARN(&rl)) {
+            struct ds ds = DS_EMPTY_INITIALIZER;
+            odp_flow_key_format(drop_key->key, drop_key->key_len, &ds);
+            VLOG_WARN("Failed to delete drop key (%s) (%s)", strerror(error),
+                      ds_cstr(&ds));
+            ds_destroy(&ds);
+        }
+
+        hmap_remove(&backer->drop_keys, &drop_key->hmap_node);
+        free(drop_key->key);
+        free(drop_key);
+    }
+}
+
 /* Given a datpath, packet, and flow metadata ('backer', 'packet', and 'key'
  * respectively), populates 'flow' with the result of odp_flow_key_to_flow().
  * Optionally, if nonnull, populates 'fitnessp' with the fitness of 'flow' as
@@ -3496,6 +3648,10 @@ handle_flow_miss(struct flow_miss *miss, struct flow_miss_op *ops,
  * odp_flow_key_to_flow().  (This differs from the value returned in
  * flow->vlan_tci only for packets received on VLAN splinters.)
  *
+ * Similarly, this function also includes some logic to help with tunnels.  It
+ * may modify 'flow' as necessary to make the tunneling implementation
+ * transparent to the upcall processing logic.
+ *
  * Returns 0 if successful, ENODEV if the parsed flow has no associated ofport,
  * or some other positive errno if there are other problems. */
 static int
@@ -3507,7 +3663,7 @@ ofproto_receive(const struct dpif_backer *backer, struct ofpbuf *packet,
 {
     const struct ofport_dpif *port;
     enum odp_key_fitness fitness;
-    int error;
+    int error = ENODEV;
 
     fitness = odp_flow_key_to_flow(key, key_len, flow);
     if (fitness == ODP_FIT_ERROR) {
@@ -3523,43 +3679,59 @@ ofproto_receive(const struct dpif_backer *backer, struct ofpbuf *packet,
         *odp_in_port = flow->in_port;
     }
 
-    port = odp_port_to_ofport(backer, flow->in_port);
-    if (!port) {
-        flow->in_port = OFPP_NONE;
-        error = ofproto ? ENODEV : 0;
-        goto exit;
+    if (tnl_port_should_receive(flow)) {
+        const struct ofport *ofport = tnl_port_receive(flow);
+        if (!ofport) {
+            flow->in_port = OFPP_NONE;
+            goto exit;
+        }
+        port = ofport_dpif_cast(ofport);
+
+        /* We can't reproduce 'key' from 'flow'. */
+        fitness = fitness == ODP_FIT_PERFECT ? ODP_FIT_TOO_MUCH : fitness;
+
+        /* XXX: Since the tunnel module is not scoped per backer, it's
+         * theoretically possible that we'll receive an ofport belonging to an
+         * entirely different datapath.  In practice, this can't happen because
+         * no platforms has two separate datapaths which each support
+         * tunneling. */
+        ovs_assert(ofproto_dpif_cast(port->up.ofproto)->backer == backer);
+    } else {
+        port = odp_port_to_ofport(backer, flow->in_port);
+        if (!port) {
+            flow->in_port = OFPP_NONE;
+            goto exit;
+        }
+
+        flow->in_port = port->up.ofp_port;
+        if (vsp_adjust_flow(ofproto_dpif_cast(port->up.ofproto), flow)) {
+            if (packet) {
+                /* Make the packet resemble the flow, so that it gets sent to
+                 * an OpenFlow controller properly, so that it looks correct
+                 * for sFlow, and so that flow_extract() will get the correct
+                 * vlan_tci if it is called on 'packet'.
+                 *
+                 * The allocated space inside 'packet' probably also contains
+                 * 'key', that is, both 'packet' and 'key' are probably part of
+                 * a struct dpif_upcall (see the large comment on that
+                 * structure definition), so pushing data on 'packet' is in
+                 * general not a good idea since it could overwrite 'key' or
+                 * free it as a side effect.  However, it's OK in this special
+                 * case because we know that 'packet' is inside a Netlink
+                 * attribute: pushing 4 bytes will just overwrite the 4-byte
+                 * "struct nlattr", which is fine since we don't need that
+                 * header anymore. */
+                eth_push_vlan(packet, flow->vlan_tci);
+            }
+            /* We can't reproduce 'key' from 'flow'. */
+            fitness = fitness == ODP_FIT_PERFECT ? ODP_FIT_TOO_MUCH : fitness;
+        }
     }
+    error = 0;
 
     if (ofproto) {
         *ofproto = ofproto_dpif_cast(port->up.ofproto);
     }
-
-    flow->in_port = port->up.ofp_port;
-    if (vsp_adjust_flow(ofproto_dpif_cast(port->up.ofproto), flow)) {
-        if (packet) {
-            /* Make the packet resemble the flow, so that it gets sent to an
-             * OpenFlow controller properly, so that it looks correct for
-             * sFlow, and so that flow_extract() will get the correct vlan_tci
-             * if it is called on 'packet'.
-             *
-             * The allocated space inside 'packet' probably also contains
-             * 'key', that is, both 'packet' and 'key' are probably part of a
-             * struct dpif_upcall (see the large comment on that structure
-             * definition), so pushing data on 'packet' is in general not a
-             * good idea since it could overwrite 'key' or free it as a side
-             * effect.  However, it's OK in this special case because we know
-             * that 'packet' is inside a Netlink attribute: pushing 4 bytes
-             * will just overwrite the 4-byte "struct nlattr", which is fine
-             * since we don't need that header anymore. */
-            eth_push_vlan(packet, flow->vlan_tci);
-        }
-
-        /* Let the caller know that we can't reproduce 'key' from 'flow'. */
-        if (fitness == ODP_FIT_PERFECT) {
-            fitness = ODP_FIT_TOO_MUCH;
-        }
-    }
-    error = 0;
 
 exit:
     if (fitnessp) {
@@ -3606,12 +3778,29 @@ handle_miss_upcalls(struct dpif_backer *backer, struct dpif_upcall *upcalls,
                                 upcall->key_len, &flow, &miss->key_fitness,
                                 &ofproto, &odp_in_port, &miss->initial_tci);
         if (error == ENODEV) {
+            struct drop_key *drop_key;
+
             /* Received packet on port for which we couldn't associate
              * an ofproto.  This can happen if a port is removed while
              * traffic is being received.  Print a rate-limited message
-             * in case it happens frequently. */
+             * in case it happens frequently.  Install a drop flow so
+             * that future packets of the flow are inexpensively dropped
+             * in the kernel. */
             VLOG_INFO_RL(&rl, "received packet on unassociated port %"PRIu32,
                          flow.in_port);
+
+            drop_key = drop_key_lookup(backer, upcall->key, upcall->key_len);
+            if (!drop_key) {
+                drop_key = xmalloc(sizeof *drop_key);
+                drop_key->key = xmemdup(upcall->key, upcall->key_len);
+                drop_key->key_len = upcall->key_len;
+
+                hmap_insert(&backer->drop_keys, &drop_key->hmap_node,
+                            hash_bytes(drop_key->key, drop_key->key_len, 0));
+                dpif_flow_put(backer->dpif, DPIF_FP_CREATE | DPIF_FP_MODIFY,
+                              drop_key->key, drop_key->key_len, NULL, 0, NULL);
+            }
+            continue;
         }
         if (error) {
             continue;
@@ -3801,6 +3990,10 @@ expire(struct dpif_backer *backer)
     struct ofproto_dpif *ofproto;
     int max_idle = INT32_MAX;
 
+    /* Periodically clear out the drop keys in an effort to keep them
+     * relatively few. */
+    drop_key_clear(backer);
+
     /* Update stats for each flow in the backer. */
     update_stats(backer);
 
@@ -3918,29 +4111,21 @@ update_stats(struct dpif_backer *backer)
     while (dpif_flow_dump_next(&dump, &key, &key_len, NULL, NULL, &stats)) {
         struct flow flow;
         struct subfacet *subfacet;
-        enum odp_key_fitness fitness;
         struct ofproto_dpif *ofproto;
-        struct ofport_dpif *port;
+        struct ofport_dpif *ofport;
         uint32_t key_hash;
 
-        fitness = odp_flow_key_to_flow(key, key_len, &flow);
-        if (fitness == ODP_FIT_ERROR) {
+        if (ofproto_receive(backer, NULL, key, key_len, &flow, NULL, &ofproto,
+                            NULL, NULL)) {
             continue;
         }
 
-        port = odp_port_to_ofport(backer, flow.in_port);
-        if (!port) {
-            /* This flow is for a port for which we couldn't associate an
-             * ofproto.  This can happen if a port is removed while
-             * traffic is being received.  Ignore this flow, since it
-             * will get timed out. */
-            continue;
+        ofport = get_ofp_port(ofproto, flow.in_port);
+        if (ofport && ofport->tnl_port) {
+            netdev_vport_inc_rx(ofport->up.netdev, stats);
         }
 
-        ofproto = ofproto_dpif_cast(port->up.ofproto);
-        flow.in_port = port->up.ofp_port;
         key_hash = odp_flow_key_hash(key, key_len);
-
         subfacet = subfacet_find(ofproto, key, key_len, key_hash, &flow);
         switch (subfacet ? subfacet->path : SF_NOT_INSTALLED) {
         case SF_FAST_PATH:
@@ -5282,6 +5467,7 @@ static int
 send_packet(const struct ofport_dpif *ofport, struct ofpbuf *packet)
 {
     const struct ofproto_dpif *ofproto = ofproto_dpif_cast(ofport->up.ofproto);
+    uint64_t odp_actions_stub[1024 / 8];
     struct ofpbuf key, odp_actions;
     struct odputil_keybuf keybuf;
     uint32_t odp_port;
@@ -5301,8 +5487,8 @@ send_packet(const struct ofport_dpif *ofport, struct ofpbuf *packet)
         }
 
         dpif_flow_stats_extract(&flow, packet, time_msec(), &stats);
-        netdev_vport_patch_inc_tx(ofport->up.netdev, &stats);
-        netdev_vport_patch_inc_rx(peer->up.netdev, &stats);
+        netdev_vport_inc_tx(ofport->up.netdev, &stats);
+        netdev_vport_inc_rx(peer->up.netdev, &stats);
 
         flow.in_port = peer->up.ofp_port;
         peer_ofproto = ofproto_dpif_cast(peer->up.ofproto);
@@ -5312,18 +5498,32 @@ send_packet(const struct ofport_dpif *ofport, struct ofpbuf *packet)
         return 0;
     }
 
-    odp_port = vsp_realdev_to_vlandev(ofproto, ofport->odp_port,
-                                      flow.vlan_tci);
-    if (odp_port != ofport->odp_port) {
-        eth_pop_vlan(packet);
-        flow.vlan_tci = htons(0);
+    ofpbuf_use_stub(&odp_actions, odp_actions_stub, sizeof odp_actions_stub);
+
+    if (ofport->tnl_port) {
+        struct dpif_flow_stats stats;
+
+        odp_port = tnl_port_send(ofport->tnl_port, &flow);
+        if (odp_port == OVSP_NONE) {
+            return ENODEV;
+        }
+
+        dpif_flow_stats_extract(&flow, packet, time_msec(), &stats);
+        netdev_vport_inc_tx(ofport->up.netdev, &stats);
+        odp_put_tunnel_action(&flow.tunnel, &odp_actions);
+    } else {
+        odp_port = vsp_realdev_to_vlandev(ofproto, ofport->odp_port,
+                                          flow.vlan_tci);
+        if (odp_port != ofport->odp_port) {
+            eth_pop_vlan(packet);
+            flow.vlan_tci = htons(0);
+        }
     }
 
     ofpbuf_use_stack(&key, &keybuf, sizeof keybuf);
     odp_flow_key_from_flow(&key, &flow,
                            ofp_port_to_odp_port(ofproto, flow.in_port));
 
-    ofpbuf_init(&odp_actions, 32);
     compose_sflow_action(ofproto, &odp_actions, &flow, odp_port);
 
     nl_msg_put_u32(&odp_actions, OVS_ACTION_ATTR_OUTPUT, odp_port);
@@ -5343,6 +5543,7 @@ send_packet(const struct ofport_dpif *ofport, struct ofpbuf *packet)
 
 /* OpenFlow to datapath action translation. */
 
+static bool may_receive(const struct ofport_dpif *, struct action_xlate_ctx *);
 static void do_xlate_actions(const struct ofpact *, size_t ofpacts_len,
                              struct action_xlate_ctx *);
 static void xlate_normal(struct action_xlate_ctx *);
@@ -5499,13 +5700,14 @@ compose_output_action__(struct action_xlate_ctx *ctx, uint16_t ofp_port,
 {
     const struct ofport_dpif *ofport = get_ofp_port(ctx->ofproto, ofp_port);
     ovs_be16 flow_vlan_tci = ctx->flow.vlan_tci;
+    ovs_be64 flow_tun_id = ctx->flow.tunnel.tun_id;
     uint8_t flow_nw_tos = ctx->flow.nw_tos;
     struct priority_to_dscp *pdscp;
     uint32_t out_port, odp_port;
 
     /* If 'struct flow' gets additional metadata, we'll need to zero it out
      * before traversing a patch port. */
-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 18);
+    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 19);
 
     if (!ofport) {
         xlate_report(ctx, "Nonexistent output port");
@@ -5522,6 +5724,7 @@ compose_output_action__(struct action_xlate_ctx *ctx, uint16_t ofp_port,
         struct ofport_dpif *peer = ofport_get_peer(ofport);
         struct flow old_flow = ctx->flow;
         const struct ofproto_dpif *peer_ofproto;
+        struct ofport_dpif *in_port;
 
         if (!peer) {
             xlate_report(ctx, "Nonexistent patch port peer");
@@ -5539,13 +5742,28 @@ compose_output_action__(struct action_xlate_ctx *ctx, uint16_t ofp_port,
         ctx->flow.metadata = htonll(0);
         memset(&ctx->flow.tunnel, 0, sizeof ctx->flow.tunnel);
         memset(ctx->flow.regs, 0, sizeof ctx->flow.regs);
-        xlate_table_action(ctx, ctx->flow.in_port, 0, true);
+
+        in_port = get_ofp_port(ctx->ofproto, ctx->flow.in_port);
+        if (!in_port || may_receive(in_port, ctx)) {
+            if (!in_port || stp_forward_in_state(in_port->stp_state)) {
+                xlate_table_action(ctx, ctx->flow.in_port, 0, true);
+            } else {
+                /* Forwarding is disabled by STP.  Let OFPP_NORMAL and the
+                 * learning action look at the packet, then drop it. */
+                struct flow old_base_flow = ctx->base_flow;
+                size_t old_size = ctx->odp_actions->size;
+                xlate_table_action(ctx, ctx->flow.in_port, 0, true);
+                ctx->base_flow = old_base_flow;
+                ctx->odp_actions->size = old_size;
+            }
+        }
+
         ctx->flow = old_flow;
         ctx->ofproto = ofproto_dpif_cast(ofport->up.ofproto);
 
         if (ctx->resubmit_stats) {
-            netdev_vport_patch_inc_tx(ofport->up.netdev, ctx->resubmit_stats);
-            netdev_vport_patch_inc_rx(peer->up.netdev, ctx->resubmit_stats);
+            netdev_vport_inc_tx(ofport->up.netdev, ctx->resubmit_stats);
+            netdev_vport_inc_rx(peer->up.netdev, ctx->resubmit_stats);
         }
 
         return;
@@ -5558,10 +5776,25 @@ compose_output_action__(struct action_xlate_ctx *ctx, uint16_t ofp_port,
     }
 
     odp_port = ofp_port_to_odp_port(ctx->ofproto, ofp_port);
-    out_port = vsp_realdev_to_vlandev(ctx->ofproto, odp_port,
-                                      ctx->flow.vlan_tci);
-    if (out_port != odp_port) {
-        ctx->flow.vlan_tci = htons(0);
+    if (ofport->tnl_port) {
+        odp_port = tnl_port_send(ofport->tnl_port, &ctx->flow);
+        if (odp_port == OVSP_NONE) {
+            xlate_report(ctx, "Tunneling decided against output");
+            return;
+        }
+
+        if (ctx->resubmit_stats) {
+            netdev_vport_inc_tx(ofport->up.netdev, ctx->resubmit_stats);
+        }
+        out_port = odp_port;
+        commit_odp_tunnel_action(&ctx->flow, &ctx->base_flow,
+                                 ctx->odp_actions);
+    } else {
+        out_port = vsp_realdev_to_vlandev(ctx->ofproto, odp_port,
+                                          ctx->flow.vlan_tci);
+        if (out_port != odp_port) {
+            ctx->flow.vlan_tci = htons(0);
+        }
     }
     commit_odp_actions(&ctx->flow, &ctx->base_flow, ctx->odp_actions);
     nl_msg_put_u32(ctx->odp_actions, OVS_ACTION_ATTR_OUTPUT, out_port);
@@ -5569,6 +5802,7 @@ compose_output_action__(struct action_xlate_ctx *ctx, uint16_t ofp_port,
     ctx->sflow_odp_port = odp_port;
     ctx->sflow_n_outputs++;
     ctx->nf_output_iface = ofp_port;
+    ctx->flow.tunnel.tun_id = flow_tun_id;
     ctx->flow.vlan_tci = flow_vlan_tci;
     ctx->flow.nw_tos = flow_nw_tos;
 }
@@ -5711,21 +5945,26 @@ execute_controller_action(struct action_xlate_ctx *ctx, int len,
 
     if (packet->l2 && packet->l3) {
         struct eth_header *eh;
+        uint16_t mpls_depth;
 
         eth_pop_vlan(packet);
         eh = packet->l2;
-
-        /* If the Ethernet type is less than ETH_TYPE_MIN, it's likely an 802.2
-         * LLC frame.  Calculating the Ethernet type of these frames is more
-         * trouble than seems appropriate for a simple assertion. */
-        ovs_assert(ntohs(eh->eth_type) < ETH_TYPE_MIN
-                   || eh->eth_type == ctx->flow.dl_type);
 
         memcpy(eh->eth_src, ctx->flow.dl_src, sizeof eh->eth_src);
         memcpy(eh->eth_dst, ctx->flow.dl_dst, sizeof eh->eth_dst);
 
         if (ctx->flow.vlan_tci & htons(VLAN_CFI)) {
             eth_push_vlan(packet, ctx->flow.vlan_tci);
+        }
+
+        mpls_depth = eth_mpls_depth(packet);
+
+        if (mpls_depth < ctx->flow.mpls_depth) {
+            push_mpls(packet, ctx->flow.dl_type, ctx->flow.mpls_lse);
+        } else if (mpls_depth > ctx->flow.mpls_depth) {
+            pop_mpls(packet, ctx->flow.dl_type);
+        } else if (mpls_depth) {
+            set_mpls_lse(packet, ctx->flow.mpls_lse);
         }
 
         if (packet->l4) {
@@ -5758,6 +5997,48 @@ execute_controller_action(struct action_xlate_ctx *ctx, int len,
 
     connmgr_send_packet_in(ctx->ofproto->up.connmgr, &pin);
     ofpbuf_delete(packet);
+}
+
+static void
+execute_mpls_push_action(struct action_xlate_ctx *ctx, ovs_be16 eth_type)
+{
+    ovs_assert(eth_type_mpls(eth_type));
+
+    if (ctx->base_flow.mpls_depth) {
+        ctx->flow.mpls_lse &= ~htonl(MPLS_BOS_MASK);
+        ctx->flow.mpls_depth++;
+    } else {
+        ovs_be32 label;
+        uint8_t tc, ttl;
+
+        if (ctx->flow.dl_type == htons(ETH_TYPE_IPV6)) {
+            label = htonl(0x2); /* IPV6 Explicit Null. */
+        } else {
+            label = htonl(0x0); /* IPV4 Explicit Null. */
+        }
+        tc = (ctx->flow.nw_tos & IP_DSCP_MASK) >> 2;
+        ttl = ctx->flow.nw_ttl ? ctx->flow.nw_ttl : 0x40;
+        ctx->flow.mpls_lse = set_mpls_lse_values(ttl, tc, 1, label);
+        ctx->flow.encap_dl_type = ctx->flow.dl_type;
+        ctx->flow.mpls_depth = 1;
+    }
+    ctx->flow.dl_type = eth_type;
+}
+
+static void
+execute_mpls_pop_action(struct action_xlate_ctx *ctx, ovs_be16 eth_type)
+{
+    ovs_assert(eth_type_mpls(ctx->flow.dl_type));
+    ovs_assert(!eth_type_mpls(eth_type));
+
+    if (ctx->flow.mpls_depth) {
+        ctx->flow.mpls_depth--;
+        ctx->flow.mpls_lse = htonl(0);
+        if (!ctx->flow.mpls_depth) {
+            ctx->flow.dl_type = eth_type;
+            ctx->flow.encap_dl_type = htons(0);
+        }
+    }
 }
 
 static bool
@@ -5901,26 +6182,6 @@ struct xlate_reg_state {
     ovs_be64 tun_id;
 };
 
-static void
-xlate_autopath(struct action_xlate_ctx *ctx,
-               const struct ofpact_autopath *ap)
-{
-    uint16_t ofp_port = ap->port;
-    struct ofport_dpif *port = get_ofp_port(ctx->ofproto, ofp_port);
-
-    if (!port || !port->bundle) {
-        ofp_port = OFPP_NONE;
-    } else if (port->bundle->bond) {
-        /* Autopath does not support VLAN hashing. */
-        struct ofport_dpif *slave = bond_choose_output_slave(
-            port->bundle->bond, &ctx->flow, 0, &ctx->tags);
-        if (slave) {
-            ofp_port = slave->up.ofp_port;
-        }
-    }
-    nxm_reg_load(&ap->dst, ofp_port, &ctx->flow);
-}
-
 static bool
 slave_enabled_cb(uint16_t ofp_port, void *ofproto_)
 {
@@ -6026,15 +6287,8 @@ static void
 do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
                  struct action_xlate_ctx *ctx)
 {
-    const struct ofport_dpif *port;
     bool was_evictable = true;
     const struct ofpact *a;
-
-    port = get_ofp_port(ctx->ofproto, ctx->flow.in_port);
-    if (port && !may_receive(port, ctx)) {
-        /* Drop this flow. */
-        return;
-    }
 
     if (ctx->rule) {
         /* Don't let the rule we're working on get evicted underneath us. */
@@ -6146,6 +6400,14 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
             nxm_execute_reg_load(ofpact_get_REG_LOAD(a), &ctx->flow);
             break;
 
+        case OFPACT_PUSH_MPLS:
+            execute_mpls_push_action(ctx, ofpact_get_PUSH_MPLS(a)->ethertype);
+            break;
+
+        case OFPACT_POP_MPLS:
+            execute_mpls_pop_action(ctx, ofpact_get_POP_MPLS(a)->ethertype);
+            break;
+
         case OFPACT_DEC_TTL:
             if (compose_dec_ttl(ctx, ofpact_get_DEC_TTL(a))) {
                 goto out;
@@ -6158,10 +6420,6 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
 
         case OFPACT_MULTIPATH:
             multipath_execute(ofpact_get_MULTIPATH(a), &ctx->flow);
-            break;
-
-        case OFPACT_AUTOPATH:
-            xlate_autopath(ctx, ofpact_get_AUTOPATH(a));
             break;
 
         case OFPACT_BUNDLE:
@@ -6215,12 +6473,6 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
     }
 
 out:
-    /* We've let OFPP_NORMAL and the learning action look at the packet,
-     * so drop it now if forwarding is disabled. */
-    if (port && !stp_forward_in_state(port->stp_state)) {
-        ofpbuf_clear(ctx->odp_actions);
-        add_sflow_action(ctx);
-    }
     if (ctx->rule) {
         ctx->rule->up.evictable = was_evictable;
     }
@@ -6283,6 +6535,7 @@ xlate_actions(struct action_xlate_ctx *ctx,
     static bool hit_resubmit_limit;
 
     enum slow_path_reason special;
+    struct ofport_dpif *in_port;
 
     COVERAGE_INC(ofproto_dpif_xlate);
 
@@ -6336,7 +6589,8 @@ xlate_actions(struct action_xlate_ctx *ctx,
         }
     }
 
-    special = process_special(ctx->ofproto, &ctx->flow, ctx->packet);
+    in_port = get_ofp_port(ctx->ofproto, ctx->flow.in_port);
+    special = process_special(ctx->ofproto, &ctx->flow, in_port, ctx->packet);
     if (special) {
         ctx->slow |= special;
     } else {
@@ -6345,7 +6599,17 @@ xlate_actions(struct action_xlate_ctx *ctx,
         uint32_t local_odp_port;
 
         add_sflow_action(ctx);
-        do_xlate_actions(ofpacts, ofpacts_len, ctx);
+
+        if (!in_port || may_receive(in_port, ctx)) {
+            do_xlate_actions(ofpacts, ofpacts_len, ctx);
+
+            /* We've let OFPP_NORMAL and the learning action look at the
+             * packet, so drop it now if forwarding is disabled. */
+            if (in_port && !stp_forward_in_state(in_port->stp_state)) {
+                ofpbuf_clear(ctx->odp_actions);
+                add_sflow_action(ctx);
+            }
+        }
 
         if (ctx->max_resubmit_trigger && !ctx->resubmit_hook) {
             if (!hit_resubmit_limit) {

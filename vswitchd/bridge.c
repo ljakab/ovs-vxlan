@@ -212,8 +212,7 @@ static struct port *port_lookup(const struct bridge *, const char *name);
 static void port_configure(struct port *);
 static struct lacp_settings *port_configure_lacp(struct port *,
                                                  struct lacp_settings *);
-static void port_configure_bond(struct port *, struct bond_settings *,
-                                uint32_t *bond_stable_ids);
+static void port_configure_bond(struct port *, struct bond_settings *);
 static bool port_is_synthetic(const struct port *);
 
 static void reconfigure_system_stats(const struct ovsrec_open_vswitch *);
@@ -761,12 +760,9 @@ port_configure(struct port *port)
     /* Get bond settings. */
     if (s.n_slaves > 1) {
         s.bond = &bond_settings;
-        s.bond_stable_ids = xmalloc(s.n_slaves * sizeof *s.bond_stable_ids);
-        port_configure_bond(port, &bond_settings, s.bond_stable_ids);
+        port_configure_bond(port, &bond_settings);
     } else {
         s.bond = NULL;
-        s.bond_stable_ids = NULL;
-
         LIST_FOR_EACH (iface, port_elem, &port->ifaces) {
             netdev_set_miimon_interval(iface->netdev, 0);
         }
@@ -779,7 +775,6 @@ port_configure(struct port *port)
     free(s.slaves);
     free(s.trunks);
     free(s.lacp_slaves);
-    free(s.bond_stable_ids);
 }
 
 /* Pick local port hardware address and datapath ID for 'br'. */
@@ -1446,9 +1441,9 @@ iface_create(struct bridge *br, struct if_cfg *if_cfg, int ofp_port)
 
             error = netdev_open(port->name, "internal", &netdev);
             if (!error) {
-                uint16_t ofp_port = if_cfg->ofport;
+                uint16_t fake_ofp_port = if_cfg->ofport;
 
-                ofproto_port_add(br->ofproto, netdev, &ofp_port);
+                ofproto_port_add(br->ofproto, netdev, &fake_ofp_port);
                 netdev_close(netdev);
             } else {
                 VLOG_WARN("could not open network device %s (%s)",
@@ -1966,15 +1961,16 @@ run_system_stats(void)
 }
 
 static inline const char *
-nx_role_to_str(enum nx_role role)
+ofp12_controller_role_to_str(enum ofp12_controller_role role)
 {
     switch (role) {
-    case NX_ROLE_OTHER:
+    case OFPCR12_ROLE_EQUAL:
         return "other";
-    case NX_ROLE_MASTER:
+    case OFPCR12_ROLE_MASTER:
         return "master";
-    case NX_ROLE_SLAVE:
+    case OFPCR12_ROLE_SLAVE:
         return "slave";
+    case OFPCR12_ROLE_NOCHANGE:
     default:
         return "*** INVALID ROLE ***";
     }
@@ -2010,7 +2006,8 @@ refresh_controller_status(void)
             }
 
             ovsrec_controller_set_is_connected(cfg, cinfo->is_connected);
-            ovsrec_controller_set_role(cfg, nx_role_to_str(cinfo->role));
+            ovsrec_controller_set_role(cfg, ofp12_controller_role_to_str(
+                                           cinfo->role));
             ovsrec_controller_set_status(cfg, &smap);
             smap_destroy(&smap);
         } else {
@@ -2804,8 +2801,10 @@ bridge_configure_remotes(struct bridge *br,
             if (!strncmp(c->target, "unix:", 5)) {
                 /* Connect to a listening socket */
                 whitelist = xasprintf("unix:%s/", ovs_rundir());
-                if (!equal_pathnames(c->target, whitelist,
-                                     strlen(whitelist))) {
+                if (strchr(c->target, '/') &&
+                   !equal_pathnames(c->target, whitelist,
+                     strlen(whitelist))) {
+                    /* Absolute path specified, but not in ovs_rundir */
                     VLOG_ERR_RL(&rl, "bridge %s: Not connecting to socket "
                                   "controller \"%s\" due to possibility for "
                                   "remote exploit.  Instead, specify socket "
@@ -3111,13 +3110,11 @@ iface_configure_lacp(struct iface *iface, struct lacp_slave_settings *s)
 }
 
 static void
-port_configure_bond(struct port *port, struct bond_settings *s,
-                    uint32_t *bond_stable_ids)
+port_configure_bond(struct port *port, struct bond_settings *s)
 {
     const char *detect_s;
     struct iface *iface;
     int miimon_interval;
-    size_t i;
 
     s->name = port->name;
     s->balance = BM_AB;
@@ -3169,17 +3166,7 @@ port_configure_bond(struct port *port, struct bond_settings *s,
 
     s->fake_iface = port->cfg->bond_fake_iface;
 
-    i = 0;
     LIST_FOR_EACH (iface, port_elem, &port->ifaces) {
-        long long stable_id;
-
-        stable_id = smap_get_int(&iface->cfg->other_config, "bond-stable-id",
-                                 0);
-        if (stable_id <= 0 || stable_id >= UINT32_MAX) {
-            stable_id = iface->ofp_port;
-        }
-        bond_stable_ids[i++] = stable_id;
-
         netdev_set_miimon_interval(iface->netdev, miimon_interval);
     }
 }
