@@ -662,7 +662,8 @@ netdev_vport_tunnel_register(void)
         TUNNEL_CLASS("gre64", "gre64_system"),
         TUNNEL_CLASS("ipsec_gre64", "gre64_system"),
         TUNNEL_CLASS("capwap", "capwap_system"),
-        TUNNEL_CLASS("vxlan", "vxlan_system")
+        TUNNEL_CLASS("vxlan", "vxlan_system"),
+        TUNNEL_CLASS("lisp", "lisp_system")
     };
 
     int i;

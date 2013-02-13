@@ -19,6 +19,7 @@ openvswitch_sources = \
 	vport-capwap.c \
 	vport-gre.c \
 	vport-internal_dev.c \
+	vport-lisp.c \
 	vport-netdev.c \
 	vport-vxlan.c
 
@@ -33,6 +34,7 @@ openvswitch_headers = \
 	vport.h \
 	vport-capwap.h \
 	vport-internal_dev.h \
+	vport-lisp.h \
 	vport-netdev.h
 
 openvswitch_extras = \
