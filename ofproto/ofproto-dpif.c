@@ -283,7 +283,6 @@ struct action_xlate_ctx {
     uint32_t sflow_odp_port;    /* Output port for composing sFlow action. */
     uint16_t user_cookie_offset;/* Used for user_action_cookie fixup. */
     bool exit;                  /* No further actions should be processed. */
-    struct flow orig_flow;      /* Copy of original flow. */
 };
 
 static void action_xlate_ctx_init(struct action_xlate_ctx *,
@@ -632,7 +631,7 @@ struct dpif_backer {
     struct timer next_expiration;
     struct hmap odp_to_ofport_map; /* ODP port to ofport mapping. */
 
-    struct sset tnl_backers;       /* Set of dpif ports backing tunnels. */
+    struct simap tnl_backers;      /* Set of dpif ports backing tunnels. */
 
     /* Facet revalidation flags applying to facets which use this backer. */
     enum revalidate_reason need_revalidate; /* Revalidate every facet. */
@@ -902,7 +901,7 @@ type_run(const char *type)
 
         HMAP_FOR_EACH (ofproto, all_ofproto_dpifs_node,
                        &all_ofproto_dpifs) {
-            if (sset_contains(&ofproto->backer->tnl_backers, devname)) {
+            if (simap_contains(&ofproto->backer->tnl_backers, devname)) {
                 goto next;
             }
         }
@@ -1027,7 +1026,7 @@ close_dpif_backer(struct dpif_backer *backer)
     drop_key_clear(backer);
     hmap_destroy(&backer->drop_keys);
 
-    sset_destroy(&backer->tnl_backers);
+    simap_destroy(&backer->tnl_backers);
     hmap_destroy(&backer->odp_to_ofport_map);
     node = shash_find(&all_dpif_backers, backer->type);
     free(backer->type);
@@ -1104,7 +1103,7 @@ open_dpif_backer(const char *type, struct dpif_backer **backerp)
     hmap_init(&backer->drop_keys);
     timer_set_duration(&backer->next_expiration, 1000);
     backer->need_revalidate = 0;
-    sset_init(&backer->tnl_backers);
+    simap_init(&backer->tnl_backers);
     tag_set_init(&backer->revalidate_set);
     *backerp = backer;
 
@@ -1630,7 +1629,7 @@ port_destruct(struct ofport *port_)
          * assumes that removal of attached ports will happen as part of
          * destruction. */
         dpif_port_del(ofproto->backer->dpif, port->odp_port);
-        sset_find_and_delete(&ofproto->backer->tnl_backers, dp_port_name);
+        simap_find_and_delete(&ofproto->backer->tnl_backers, dp_port_name);
     }
 
     if (port->odp_port != OVSP_NONE && !port->tnl_port) {
@@ -3015,15 +3014,20 @@ port_add(struct ofproto *ofproto_, struct netdev *netdev)
     }
 
     if (!dpif_port_exists(ofproto->backer->dpif, dp_port_name)) {
-        int error = dpif_port_add(ofproto->backer->dpif, netdev, NULL);
+        uint32_t port_no = UINT32_MAX;
+        int error;
+
+        error = dpif_port_add(ofproto->backer->dpif, netdev, &port_no);
         if (error) {
             return error;
+        }
+        if (netdev_get_tunnel_config(netdev)) {
+            simap_put(&ofproto->backer->tnl_backers, dp_port_name, port_no);
         }
     }
 
     if (netdev_get_tunnel_config(netdev)) {
         sset_add(&ofproto->ghost_ports, devname);
-        sset_add(&ofproto->backer->tnl_backers, dp_port_name);
     } else {
         sset_add(&ofproto->ports, devname);
     }
@@ -3090,7 +3094,7 @@ port_del(struct ofproto *ofproto_, uint16_t ofp_port)
              * from the bond.  The client will need to reconfigure everything
              * after deleting ports, so then the slave will get re-added. */
             dpif_port = netdev_vport_get_dpif_port(ofport->up.netdev);
-            sset_find_and_delete(&ofproto->backer->tnl_backers, dpif_port);
+            simap_find_and_delete(&ofproto->backer->tnl_backers, dpif_port);
             bundle_remove(&ofport->up);
         }
     }
@@ -3884,7 +3888,16 @@ classify_upcall(const struct dpif_upcall *upcall)
     }
 
     /* "action" upcalls need a closer look. */
-    memcpy(&cookie, &upcall->userdata, sizeof(cookie));
+    if (!upcall->userdata) {
+        VLOG_WARN_RL(&rl, "action upcall missing cookie");
+        return BAD_UPCALL;
+    }
+    if (nl_attr_get_size(upcall->userdata) != sizeof(cookie)) {
+        VLOG_WARN_RL(&rl, "action upcall cookie has unexpected size %zu",
+                     nl_attr_get_size(upcall->userdata));
+        return BAD_UPCALL;
+    }
+    memcpy(&cookie, nl_attr_get(upcall->userdata), sizeof(cookie));
     switch (cookie.type) {
     case USER_ACTION_COOKIE_SFLOW:
         return SFLOW_UPCALL;
@@ -3894,7 +3907,8 @@ classify_upcall(const struct dpif_upcall *upcall)
 
     case USER_ACTION_COOKIE_UNSPEC:
     default:
-        VLOG_WARN_RL(&rl, "invalid user cookie : 0x%"PRIx64, upcall->userdata);
+        VLOG_WARN_RL(&rl, "invalid user cookie : 0x%"PRIx64,
+                     nl_attr_get_u64(upcall->userdata));
         return BAD_UPCALL;
     }
 }
@@ -3914,7 +3928,7 @@ handle_sflow_upcall(struct dpif_backer *backer,
         return;
     }
 
-    memcpy(&cookie, &upcall->userdata, sizeof(cookie));
+    memcpy(&cookie, nl_attr_get(upcall->userdata), sizeof(cookie));
     dpif_sflow_received(ofproto->sflow, upcall->packet, &flow,
                         odp_in_port, &cookie);
 }
@@ -5574,7 +5588,7 @@ compose_slow_path(const struct ofproto_dpif *ofproto, const struct flow *flow,
     ofpbuf_use_stack(&buf, stub, stub_size);
     if (slow & (SLOW_CFM | SLOW_LACP | SLOW_STP)) {
         uint32_t pid = dpif_port_get_pid(ofproto->backer->dpif, UINT32_MAX);
-        odp_put_userspace_action(pid, &cookie, &buf);
+        odp_put_userspace_action(pid, &cookie, sizeof cookie, &buf);
     } else {
         put_userspace_action(ofproto, &buf, flow, &cookie);
     }
@@ -5593,7 +5607,7 @@ put_userspace_action(const struct ofproto_dpif *ofproto,
     pid = dpif_port_get_pid(ofproto->backer->dpif,
                             ofp_port_to_odp_port(ofproto, flow->in_port));
 
-    return odp_put_userspace_action(pid, cookie, odp_actions);
+    return odp_put_userspace_action(pid, cookie, sizeof *cookie, odp_actions);
 }
 
 static void
@@ -5724,6 +5738,7 @@ compose_output_action__(struct action_xlate_ctx *ctx, uint16_t ofp_port,
         struct ofport_dpif *peer = ofport_get_peer(ofport);
         struct flow old_flow = ctx->flow;
         const struct ofproto_dpif *peer_ofproto;
+        enum slow_path_reason special;
         struct ofport_dpif *in_port;
 
         if (!peer) {
@@ -5744,7 +5759,11 @@ compose_output_action__(struct action_xlate_ctx *ctx, uint16_t ofp_port,
         memset(ctx->flow.regs, 0, sizeof ctx->flow.regs);
 
         in_port = get_ofp_port(ctx->ofproto, ctx->flow.in_port);
-        if (!in_port || may_receive(in_port, ctx)) {
+        special = process_special(ctx->ofproto, &ctx->flow, in_port,
+                                  ctx->packet);
+        if (special) {
+            ctx->slow |= special;
+        } else if (!in_port || may_receive(in_port, ctx)) {
             if (!in_port || stp_forward_in_state(in_port->stp_state)) {
                 xlate_table_action(ctx, ctx->flow.in_port, 0, true);
             } else {
@@ -6536,6 +6555,7 @@ xlate_actions(struct action_xlate_ctx *ctx,
 
     enum slow_path_reason special;
     struct ofport_dpif *in_port;
+    struct flow orig_flow;
 
     COVERAGE_INC(ofproto_dpif_xlate);
 
@@ -6558,12 +6578,8 @@ xlate_actions(struct action_xlate_ctx *ctx,
 
     if (ctx->ofproto->has_mirrors || hit_resubmit_limit) {
         /* Do this conditionally because the copy is expensive enough that it
-         * shows up in profiles.
-         *
-         * We keep orig_flow in 'ctx' only because I couldn't make GCC 4.4
-         * believe that I wasn't using it without initializing it if I kept it
-         * in a local variable. */
-        ctx->orig_flow = ctx->flow;
+         * shows up in profiles. */
+        orig_flow = ctx->flow;
     }
 
     if (ctx->flow.nw_frag & FLOW_NW_FRAG_ANY) {
@@ -6619,7 +6635,7 @@ xlate_actions(struct action_xlate_ctx *ctx,
             } else if (!VLOG_DROP_ERR(&trace_rl)) {
                 struct ds ds = DS_EMPTY_INITIALIZER;
 
-                ofproto_trace(ctx->ofproto, &ctx->orig_flow, ctx->packet,
+                ofproto_trace(ctx->ofproto, &orig_flow, ctx->packet,
                               initial_tci, &ds);
                 VLOG_ERR("Trace triggered by excessive resubmit "
                          "recursion:\n%s", ds_cstr(&ds));
@@ -6640,7 +6656,7 @@ xlate_actions(struct action_xlate_ctx *ctx,
             }
         }
         if (ctx->ofproto->has_mirrors) {
-            add_mirror_actions(ctx, &ctx->orig_flow);
+            add_mirror_actions(ctx, &orig_flow);
         }
         fix_sflow_action(ctx);
     }
