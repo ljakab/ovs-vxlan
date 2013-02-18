@@ -185,9 +185,9 @@ enum ovs_vport_type {
 	OVS_VPORT_TYPE_INTERNAL, /* network device implemented by datapath */
 	OVS_VPORT_TYPE_GRE,	 /* GRE tunnel. */
 	OVS_VPORT_TYPE_VXLAN,    /* VXLAN tunnel */
-	OVS_VPORT_TYPE_LISP,     /* LISP tunnel */
 	OVS_VPORT_TYPE_CAPWAP = 102,  /* CAPWAP tunnel */
 	OVS_VPORT_TYPE_GRE64 = 104, /* GRE tunnel with 64-bit keys */
+	OVS_VPORT_TYPE_LISP = 105,  /* LISP tunnel */
 	__OVS_VPORT_TYPE_MAX
 };
 

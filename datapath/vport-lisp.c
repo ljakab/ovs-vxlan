@@ -133,9 +133,9 @@ static int lisp_tnl_send(struct vport *vport, struct sk_buff *skb)
 	int network_offset = skb_network_offset(skb);
 
 	/* We only encapsulate IPv4 and IPv6 packets */
-	switch (ntohs(skb->protocol)) {
-	case ETH_P_IP:
-	case ETH_P_IPV6:
+	switch (skb->protocol) {
+	case htons(ETH_P_IP):
+	case htons(ETH_P_IPV6):
 		/* Pop off "inner" Ethernet header */
 		skb_pull(skb, network_offset);
 		return ovs_tnl_send(vport, skb) + network_offset;
@@ -234,8 +234,7 @@ static int lisp_rcv(struct sock *sk, struct sk_buff *skb)
 
 	lisph = lisp_hdr(skb);
 
-	__skb_pull(skb, LISP_HLEN);
-	skb_postpull_rcsum(skb, skb_transport_header(skb), LISP_HLEN);
+	skb_pull_rcsum(skb, LISP_HLEN);
 
 	if (lisph->instance_id_present != 1)
 		key = 0;
@@ -244,11 +243,9 @@ static int lisp_rcv(struct sock *sk, struct sk_buff *skb)
 
 	iph = ip_hdr(skb);
 	vport = ovs_tnl_find_port(dev_net(skb->dev), iph->daddr, iph->saddr,
-				  key, TNL_T_PROTO_LISP, &mutable);
-	if (unlikely(!vport)) {
-		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, 0);
+		key, TNL_T_PROTO_LISP, &mutable);
+	if (unlikely(!vport))
 		goto error;
-	}
 
 	if (mutable->flags & TNL_F_IN_KEY_MATCH || !mutable->key.daddr)
 		tunnel_flags = OVS_TNL_F_KEY;
@@ -291,7 +288,7 @@ out:
 }
 
 /* Arbitrary value.  Irrelevant as long as it's not 0 since we set the handler. */
-#define UDP_ENCAP_LISP 7
+#define UDP_ENCAP_LISP 1
 static int lisp_socket_init(struct net *net)
 {
 	int err;
