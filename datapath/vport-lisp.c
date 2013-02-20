@@ -136,6 +136,7 @@ static inline struct lisphdr *lisp_hdr(const struct sk_buff *skb)
 
 static int lisp_tnl_send(struct vport *vport, struct sk_buff *skb)
 {
+	int tnl_len;
 	int network_offset = skb_network_offset(skb);
 
 	/* We only encapsulate IPv4 and IPv6 packets */
@@ -144,7 +145,8 @@ static int lisp_tnl_send(struct vport *vport, struct sk_buff *skb)
 	case htons(ETH_P_IPV6):
 		/* Pop off "inner" Ethernet header */
 		skb_pull(skb, network_offset);
-		return ovs_tnl_send(vport, skb) + network_offset;
+		tnl_len = ovs_tnl_send(vport, skb);
+		return tnl_len > 0 ? tnl_len + network_offset : tnl_len;
 	default:
 		kfree_skb(skb);
 		return 0;
