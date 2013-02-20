@@ -159,6 +159,7 @@ int ovs_tnl_get_options(const struct vport *, struct sk_buff *);
 const char *ovs_tnl_get_name(const struct vport *vport);
 int ovs_tnl_send(struct vport *vport, struct sk_buff *skb);
 void ovs_tnl_rcv(struct vport *vport, struct sk_buff *skb);
+u16 ovs_tnl_get_src_port(struct sk_buff *skb);
 
 struct vport *ovs_tnl_find_port(struct net *net, __be32 saddr, __be32 daddr,
 				__be64 key, int tunnel_type,
