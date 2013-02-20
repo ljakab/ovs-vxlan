@@ -344,14 +344,14 @@ static void lisp_tunnel_release(struct lisp_port *lisp_port)
 }
 
 static int lisp_tunnel_setup(struct net *net, struct nlattr *options,
-			     struct lisp_port **vxport)
+			     struct lisp_port **lport)
 {
 	struct nlattr *a;
 	int err;
 	u16 dst_port;
 	struct lisp_port *lisp_port = NULL;
 
-	*vxport = NULL;
+	*lport = NULL;
 
 	if (!options) {
 		err = -EINVAL;
@@ -372,7 +372,7 @@ static int lisp_tunnel_setup(struct net *net, struct nlattr *options,
 	if (lisp_port) {
 		lisp_port->count++;
 		err = 0;
-		*vxport = lisp_port;
+		*lport = lisp_port;
 		goto out;
 	}
 
@@ -391,7 +391,7 @@ static int lisp_tunnel_setup(struct net *net, struct nlattr *options,
 	if (err)
 		goto error;
 
-	*vxport = lisp_port;
+	*lport = lisp_port;
 	goto out;
 
 error:
