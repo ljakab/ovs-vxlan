@@ -278,7 +278,7 @@ static int lisp_rcv(struct sock *sk, struct sk_buff *skb)
 	}
 
 	/* Add Ethernet header */
-	ethh = skb_push(skb, ETH_HLEN);
+	ethh = (struct ethhdr *)skb_push(skb, ETH_HLEN);
 	memset(ethh, 0, ETH_HLEN);
 	ethh->h_dest[0] = 0x02;
 	ethh->h_source[0] = 0x02;

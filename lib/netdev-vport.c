@@ -114,32 +114,13 @@ netdev_vport_is_patch(const struct netdev *netdev)
 }
 
 static bool
-netdev_vport_is_vxlan(const struct netdev *netdev)
+netdev_vport_needs_dst_port(const struct netdev_dev *dev)
 {
-    const struct netdev_dev *dev = netdev_get_dev(netdev);
     const struct netdev_class *class = netdev_dev_get_class(dev);
     const char *type = netdev_dev_get_type(dev);
 
-    return (class->get_config == get_tunnel_config
-            && !strcmp("vxlan", type));
-}
-
-static bool
-netdev_vport_is_lisp(const struct netdev *netdev)
-{
-    const struct netdev_dev *dev = netdev_get_dev(netdev);
-    const struct netdev_class *class = netdev_dev_get_class(dev);
-    const char *type = netdev_dev_get_type(dev);
-
-    return (class->get_config == get_tunnel_config
-            && !strcmp("lisp", type));
-}
-
-static bool
-netdev_vport_needs_port_number(const struct netdev *netdev)
-{
-    return (netdev_vport_is_vxlan(netdev) ||
-            netdev_vport_is_lisp(netdev));
+    return (class->get_config == get_tunnel_config &&
+            (!strcmp("vxlan", type) || !strcmp("lisp", type)));
 }
 
 const char *
@@ -149,7 +130,7 @@ netdev_vport_get_dpif_port(const struct netdev *netdev)
     const struct netdev_class *class = netdev_dev_get_class(dev);
     const char *dpif_port;
 
-    if (netdev_vport_needs_port_number(netdev)) {
+    if (netdev_vport_needs_dst_port(dev)) {
         const struct netdev_dev_vport *vport = netdev_vport_get_dev(netdev);
         const char *type = netdev_dev_get_type(dev);
         static char dpif_port_combined[IFNAMSIZ];
@@ -339,7 +320,7 @@ set_tunnel_config(struct netdev_dev *dev_, const struct smap *args)
     ipsec_mech_set = false;
     memset(&tnl_cfg, 0, sizeof tnl_cfg);
 
-    needs_dst_port = !strcmp(type, "vxlan") || !strcmp(type, "lisp");
+    needs_dst_port = netdev_vport_needs_dst_port(dev_);
     tnl_cfg.ipsec = strstr(type, "ipsec");
     tnl_cfg.dont_fragment = true;
 
