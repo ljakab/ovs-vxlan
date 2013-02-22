@@ -174,8 +174,9 @@ static __be64 instance_id_to_tunnel_id(__u8 *iid)
 #ifdef __BIG_ENDIAN
 	return (iid[0] << 16) | (iid[1] << 8) | iid[2];
 #else
-	return ((__force __be64)iid[0] << 40) | ((__force __be64)iid[1] << 48) |
-	       ((__force __be64)iid[2] << 56);
+	return (__force __be64)(((__force u64)iid[0] << 40) |
+				((__force u64)iid[1] << 48) |
+				((__force u64)iid[2] << 56));
 #endif
 }
 
